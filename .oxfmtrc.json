@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "printWidth": 100,
+  "singleQuote": true,
+  "semi": true,
+  "trailingComma": "all",
+  "objectWrap": "preserve",
+  "experimentalOperatorPosition": "start",
+  "sortImports": {
+    "internalPattern": ["@supapower/"],
+    "newlinesBetween": true,
+    "groups": [
+      "builtin",
+      "external",
+      ["internal", "subpath"],
+      ["parent", "sibling", "index"],
+      "style",
+      "unknown"
+    ]
+  },
+  "sortPackageJson": true,
+  "ignorePatterns": ["**/dist/**", "**/*.tsbuildinfo", "bun.lock", "CHANGELOG.md"]
+}
