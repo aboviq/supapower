@@ -1,5 +1,7 @@
 # Supapower
 
+![Supapower](./assets/supapower.svg)
+
 Supapower is a sync engine that keeps a local [PGlite](https://pglite.dev/) database in sync with
 [Supabase](https://supabase.com/), so an application can read and write locally and stay usable
 while offline. It is inspired by [PowerSync](https://www.powersync.com/).
