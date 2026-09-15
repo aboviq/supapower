@@ -1,9 +1,101 @@
 import type { PGliteInterface } from '@electric-sql/pglite';
+import type { SupabaseClient } from '@supabase/supabase-js';
 
 import { createLeadership } from './leadership.js';
 import { runMigrations, trackTables } from './migrations.js';
-import { resolveTables, runOutgoingSync } from './sync.js';
+import {
+  type ResolvedTableConfig,
+  resolveTables,
+  runIncomingSync,
+  runOutgoingSync,
+} from './sync.js';
 import type { SupapowerNamespace, SupapowerSync, SupapowerSyncOptions } from './types.js';
+
+/** Stands in for a client whose token the application owns. */
+const EXTERNAL_AUTH = Symbol('external-auth');
+
+/** Who the tables are being synced for. `null` means nobody is signed in. */
+type AuthIdentity = string | null | typeof EXTERNAL_AUTH;
+
+/**
+ * Follows who is signed in, starting with the session that is already there.
+ *
+ * Only the identity matters, not the token: supabase-js pushes a refreshed
+ * token onto the realtime socket by itself, so a `TOKEN_REFRESHED` event needs
+ * no reaction here.
+ */
+function watchAuthIdentity(
+  supabase: SupabaseClient,
+  onChange: (identity: AuthIdentity) => void,
+): () => void {
+  try {
+    const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+      onChange(session?.user.id ?? null);
+    });
+
+    return () => data.subscription.unsubscribe();
+  } catch {
+    // A client built with the `accessToken` option replaces `supabase.auth`
+    // with a proxy that throws on every access: the application owns the token,
+    // so there is no auth state to follow and every table stays reachable.
+    onChange(EXTERNAL_AUTH);
+
+    return () => {};
+  }
+}
+
+interface IncomingSupervisorOptions {
+  pg: PGliteInterface;
+  supabase: SupabaseClient;
+  tables: Map<string, ResolvedTableConfig>;
+  /** Aborted when leadership is lost or the sync is unsubscribed. */
+  signal: AbortSignal;
+}
+
+/**
+ * Keeps an incoming subscription open for whichever tables the current user can
+ * actually see.
+ *
+ * Tables marked `anon` are subscribed to at all times; the ones left on the
+ * default `authenticated` only while somebody is signed in. Because that set
+ * changes when the user does, the subscription is torn down and rebuilt on
+ * every identity change - a channel cannot have bindings added to it after it
+ * has been subscribed.
+ */
+function superviseIncomingSync({ pg, supabase, tables, signal }: IncomingSupervisorOptions): void {
+  const anonymous = new Map([...tables].filter(([, config]) => config.access === 'anon'));
+
+  let identity: AuthIdentity | undefined;
+  let running: AbortController | undefined;
+
+  const restart = (next: AuthIdentity) => {
+    if (signal.aborted || next === identity) {
+      return; // same user as before, the open channel is still the right one
+    }
+
+    identity = next;
+    running?.abort();
+    running = new AbortController();
+
+    void runIncomingSync({
+      pg,
+      supabase,
+      tables: next === null ? anonymous : tables,
+      signal: running.signal,
+    });
+  };
+
+  const stopWatching = watchAuthIdentity(supabase, restart);
+
+  signal.addEventListener(
+    'abort',
+    () => {
+      stopWatching();
+      running?.abort();
+    },
+    { once: true },
+  );
+}
 
 /**
  * Shape of the {@link supapower} extension.
@@ -74,6 +166,9 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
       }
 
       stopLeadership = leadership.subscribe((leaderSignal) => {
+        // Both directions run on the leader only: every tab shares one
+        // database, so a second syncer would otherwise duplicate every write.
+
         // Resolves when leadership is lost; the loop handles its own failures.
         void runOutgoingSync({
           pg,
@@ -82,6 +177,8 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
           signal: leaderSignal,
           ...(onUnrecoverableError ? { onUnrecoverableError } : {}),
         });
+
+        superviseIncomingSync({ pg, supabase, tables: configs, signal: leaderSignal });
       });
 
       return handle;

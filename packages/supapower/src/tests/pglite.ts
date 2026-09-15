@@ -7,6 +7,7 @@ interface QueryResult {
 }
 
 type FakeSql = (strings: TemplateStringsArray, ...values: unknown[]) => Promise<QueryResult>;
+type FakeQuery = (query: string, params?: unknown[]) => Promise<QueryResult>;
 
 export interface FakePGlite {
   /** Every statement issued, whitespace collapsed and parameters shown as `?`. */
@@ -15,7 +16,8 @@ export interface FakePGlite {
   readonly queue: ChangeRow[];
   readonly waitReady: Promise<void>;
   sql: FakeSql;
-  transaction<T>(callback: (tx: { sql: FakeSql }) => Promise<T>): Promise<T>;
+  query: FakeQuery;
+  transaction<T>(callback: (tx: { sql: FakeSql; query: FakeQuery }) => Promise<T>): Promise<T>;
   listen(): Promise<() => Promise<void>>;
 }
 
@@ -74,12 +76,19 @@ function createBase({ changes = [] }: FakePGliteOptions): FakePGlite {
     return Promise.resolve({ rows: [] });
   };
 
+  const query: FakeQuery = (text) => {
+    statements.push(text.replaceAll(/\s+/g, ' ').trim());
+
+    return Promise.resolve({ rows: [] });
+  };
+
   return {
     statements,
     queue,
     waitReady: Promise.resolve(),
     sql,
-    transaction: (callback) => callback({ sql }),
+    query,
+    transaction: (callback) => callback({ sql, query }),
     listen: () => Promise.resolve(() => Promise.resolve()),
   };
 }

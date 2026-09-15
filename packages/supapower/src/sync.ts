@@ -2,8 +2,12 @@
 // pipeline: batches go upstream oldest first, and every statement inside a batch
 // has to land before the next one. Parallelizing any of it would reorder writes.
 
-import type { PGliteInterface } from '@electric-sql/pglite';
-import type { SupabaseClient } from '@supabase/supabase-js';
+import type { PGliteInterface, Transaction } from '@electric-sql/pglite';
+import {
+  REALTIME_SUBSCRIBE_STATES,
+  type RealtimePostgresChangesPayload,
+  type SupabaseClient,
+} from '@supabase/supabase-js';
 
 import {
   getNextSyncTransaction,
@@ -12,7 +16,9 @@ import {
 } from './changes.js';
 import { CHANGES_CHANNEL } from './constants.js';
 import { isUnrecoverableUploadError, SupapowerError, SupapowerUploadError } from './errors.js';
+import { setSyncedIncomingAt } from './metadata.js';
 import type { SupapowerTableConfig } from './types.js';
+import { escapeIdentifier, executeInTransaction } from './utils.js';
 
 /** Safety net in case a notification is missed while leadership changes hands. */
 const IDLE_POLL_MS = 30_000;
@@ -248,5 +254,178 @@ export async function runOutgoingSync({
 
       attempt += 1;
     }
+  }
+}
+
+/**
+ * Handles an incoming change from Supabase by applying it to the local database.
+ * Supports INSERT, UPDATE, and DELETE events.
+ *
+ * @param pg The PGlite interface or transaction to execute the change within.
+ * @param payload The payload describing the incoming change from Supabase.
+ * @param primaryKey The primary key column of the table being changed.
+ */
+async function handleIncomingChange(
+  pg: PGliteInterface | Transaction,
+  payload: RealtimePostgresChangesPayload<Record<string, unknown>>,
+  primaryKey: string,
+) {
+  const columns: string[] = [];
+  const parameters: unknown[] = [];
+
+  for (const [column, value] of Object.entries(payload.new)) {
+    columns.push(column);
+    parameters.push(value);
+  }
+
+  let query: string;
+
+  if (payload.eventType === 'INSERT') {
+    query = `
+      INSERT INTO ${escapeIdentifier(payload.schema, payload.table)} (
+        ${columns.map((column) => escapeIdentifier(column)).join(',\n        ')}
+      )
+      VALUES (
+        ${columns.map((_, index) => `$${index + 1}`).join(',\n        ')}
+      )
+      ON CONFLICT (${escapeIdentifier(primaryKey)}) DO UPDATE SET
+        ${columns.map((column) => `${escapeIdentifier(column)} = EXCLUDED.${escapeIdentifier(column)}`).join(',\n        ')}
+    `;
+  } else if (payload.eventType === 'UPDATE') {
+    parameters.push(payload.old[primaryKey]);
+    query = `
+      UPDATE
+        ${escapeIdentifier(payload.schema, payload.table)}
+      SET
+        ${columns.map((column, index) => `${escapeIdentifier(column)} = $${index + 1}`).join(',\n        ')}
+      WHERE
+        ${escapeIdentifier(primaryKey)} = $${parameters.length}
+    `;
+  } else if (payload.eventType === 'DELETE') {
+    parameters.length = 0;
+    parameters.push(payload.old[primaryKey]);
+    query = `DELETE FROM ${escapeIdentifier(payload.schema, payload.table)} WHERE ${escapeIdentifier(primaryKey)} = $${parameters.length}`;
+  }
+
+  await executeInTransaction(pg, async (tx) => {
+    await tx.sql`SELECT set_config('supapower.applying', 'true', true)`;
+
+    await tx.query(query, parameters);
+
+    await setSyncedIncomingAt(tx, payload.table, new Date(payload.commit_timestamp));
+  });
+}
+
+export interface IncomingSyncOptions {
+  pg: PGliteInterface;
+  supabase: SupabaseClient;
+  /**
+   * The tables to subscribe to.
+   *
+   * Already filtered for the current user - deciding which tables are
+   * reachable is the caller's job, see `access` in `SupapowerTableConfig`.
+   */
+  tables: Map<string, ResolvedTableConfig>;
+  /**
+   * Aborted when leadership is lost, when the signed in user changes, or when
+   * the sync is unsubscribed.
+   */
+  signal: AbortSignal;
+  /** Overrides the generated channel name. */
+  channel?: string;
+  /** Called when a change could not be applied, or the channel reports trouble. */
+  onError?: (error: unknown) => void;
+}
+
+/**
+ * Applies remote changes locally for as long as the signal is live.
+ *
+ * Subscribes one realtime channel to `postgres_changes` on every table it is
+ * given and writes each change straight into the local database, with
+ * `supapower.applying` set so the change triggers do not queue it right back up
+ * as an outgoing change.
+ *
+ * Runs only on the tab that holds leadership. Every tab shares one database, so
+ * a subscription per tab would apply each change as many times as there are
+ * tabs open.
+ *
+ * This function does not look at authentication. It subscribes to exactly the
+ * tables it is handed and keeps that subscription until the signal aborts -
+ * which is what makes it cheap for the caller to restart it with a different
+ * set when the user signs in or out.
+ */
+export async function runIncomingSync({
+  pg,
+  supabase,
+  tables,
+  signal,
+  channel = `supapower:incoming:${crypto.randomUUID()}`,
+  onError,
+}: IncomingSyncOptions): Promise<void> {
+  if (signal.aborted || tables.size === 0) {
+    return; // nothing this user is allowed to see
+  }
+
+  // Realtime hands us its callbacks synchronously while applying a change is
+  // async, so the work is chained: two updates to the same row have to land in
+  // the order they were broadcast.
+  let applying: Promise<void> = Promise.resolve();
+
+  const apply = (payload: RealtimePostgresChangesPayload<Record<string, unknown>>, key: string) => {
+    const previous = applying;
+
+    applying = (async () => {
+      await previous;
+
+      if (signal.aborted) {
+        return;
+      }
+
+      try {
+        await handleIncomingChange(pg, payload, key);
+      } catch (error: unknown) {
+        // Caught per change so one bad row cannot break the chain for the rest.
+        onError?.(error);
+      }
+    })();
+  };
+
+  let subscription = supabase.channel(channel);
+
+  for (const { table, primaryKey } of tables.values()) {
+    subscription = subscription.on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table },
+      (payload: RealtimePostgresChangesPayload<Record<string, unknown>>) =>
+        apply(payload, primaryKey),
+    );
+  }
+
+  const closed = new Promise<void>((resolve) => {
+    signal.addEventListener('abort', () => resolve(), { once: true });
+
+    subscription.subscribe((status, error) => {
+      if (
+        status === REALTIME_SUBSCRIBE_STATES.SUBSCRIBED
+        || status === REALTIME_SUBSCRIBE_STATES.CLOSED
+      ) {
+        return; // CLOSED is what unsubscribing looks like from in here
+      }
+
+      // CHANNEL_ERROR and TIMED_OUT are reported but not acted on: realtime-js
+      // rejoins on its own, and tearing the channel down here would fight it.
+      onError?.(
+        error
+          ?? new SupapowerError(`Realtime channel "${channel}" reported ${status}`, {
+            code: 'connection_failed',
+          }),
+      );
+    });
+  });
+
+  try {
+    await closed;
+  } finally {
+    await Promise.all([supabase.removeChannel(subscription), applying]);
   }
 }

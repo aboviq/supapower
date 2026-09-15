@@ -114,6 +114,10 @@ export interface SupapowerSync {
    *
    * Local changes will still be tracked but the queue of outgoing changes will no longer be processed.
    *
+   * Returns as soon as the sync has been signalled to stop. Leaving the realtime
+   * channel is a round trip to the server and settles shortly afterwards, so do
+   * not tear the Supabase client down in the same tick.
+   *
    * Safe to call more than once.
    */
   unsubscribe(): void;

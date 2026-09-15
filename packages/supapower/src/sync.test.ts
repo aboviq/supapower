@@ -32,7 +32,9 @@ describe('runOutgoingSync', () => {
 
   test('discards a batch Supabase will never accept, by default', async () => {
     const pg = createFakePGlite({ changes: [createChange('100', 1), createChange('100', 2)] });
-    const supabase = createFakeSupabase(() => ({ code: '23505', message: 'duplicate key' }));
+    const supabase = createFakeSupabase({
+      respond: () => ({ code: '23505', message: 'duplicate key' }),
+    });
     const controller = new AbortController();
     const errors: unknown[] = [];
 
@@ -56,7 +58,7 @@ describe('runOutgoingSync', () => {
 
   test('keeps a batch queued when the failure is transient', async () => {
     const pg = createFakePGlite({ changes: [createChange('100', 1)] });
-    const supabase = createFakeSupabase(() => ({ code: '08006', message: 'offline' }));
+    const supabase = createFakeSupabase({ respond: () => ({ code: '08006', message: 'offline' }) });
     const controller = new AbortController();
     const errors: unknown[] = [];
 
@@ -78,9 +80,9 @@ describe('runOutgoingSync', () => {
 
   test('hands a rejected batch to a custom handler', async () => {
     const pg = createFakePGlite({ changes: [createChange('100', 1), createChange('100', 2)] });
-    const supabase = createFakeSupabase((call) =>
-      call === 0 ? null : { code: '42501', message: 'row-level security' },
-    );
+    const supabase = createFakeSupabase({
+      respond: (call) => (call === 0 ? null : { code: '42501', message: 'row-level security' }),
+    });
     const controller = new AbortController();
     const seen: UnrecoverableUploadError[] = [];
 
@@ -109,7 +111,9 @@ describe('runOutgoingSync', () => {
 
   test('retries when the handler keeps the batch instead of committing', async () => {
     const pg = createFakePGlite({ changes: [createChange('100', 1)] });
-    const supabase = createFakeSupabase(() => ({ code: '23502', message: 'not null' }));
+    const supabase = createFakeSupabase({
+      respond: () => ({ code: '23502', message: 'not null' }),
+    });
     const controller = new AbortController();
     const errors: unknown[] = [];
     let handled = 0;
