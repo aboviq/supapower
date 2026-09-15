@@ -17,5 +17,6 @@
   },
   "[yaml]": {
     "editor.defaultFormatter": "oxc.oxc-vscode"
-  }
+  },
+  "cSpell.words": ["pglite", "Supabase", "Supapower"]
 }
