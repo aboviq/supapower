@@ -23,6 +23,24 @@ export interface SupapowerTableConfig {
   primaryKey?: string;
 
   /**
+   * Name of a timestamp column that is set to the current time on every write,
+   * typically `updated_at`.
+   *
+   * Given one, the download after the first only asks for rows at or after the
+   * last one it saw, instead of pulling the whole table again. Without one every
+   * start is a full download.
+   *
+   * The column has to move on **every** change that should reach the client,
+   * deletions included - see the schema recommendations in the readme. A row
+   * whose timestamp does not move is invisible to an incremental download.
+   *
+   * Hard `DELETE`s cannot be picked up this way, since the row is simply gone.
+   * Use soft deletes, or accept that removals only arrive over realtime while
+   * the client is connected.
+   */
+  cursor?: string;
+
+  /**
    * Who can access the remote table?
    *
    * Use 'anon' for tables accessible by anyone, i.e. even those not signed in.

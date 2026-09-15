@@ -18,8 +18,11 @@ import {
 import { CHANGES_CHANNEL } from './constants.js';
 import { isUnrecoverableUploadError, SupapowerError, SupapowerUploadError } from './errors.js';
 import {
+  clearSyncedCursorAt,
   clearSyncedIncomingAt,
+  getSyncedCursorAt,
   getSyncedUser,
+  setSyncedCursorAt,
   setSyncedIncomingAt,
   setSyncedUser,
 } from './metadata.js';
@@ -32,11 +35,25 @@ const IDLE_POLL_MS = 30_000;
 const RETRY_BASE_MS = 1_000;
 const RETRY_MAX_MS = 60_000;
 
+/**
+ * How far back an incremental download reaches beyond the last cursor value it
+ * saw.
+ *
+ * A write stamps its cursor column with the transaction's start time but only
+ * becomes visible when it commits, so a slow transaction can land a row
+ * *behind* a watermark that has already moved past it. Reaching back covers
+ * transactions up to this long; anything slower is missed until the table is
+ * downloaded whole again.
+ */
+const CURSOR_MARGIN_MS = 60_000;
+
 /** A table config with the defaults filled in. */
 export interface ResolvedTableConfig {
   table: string;
   primaryKey: string;
   access: 'anon' | 'authenticated';
+  /** Timestamp column an incremental download filters on, when there is one. */
+  cursor?: string;
 }
 
 /** Fills in the defaults for a table entry and keys them by table name. */
@@ -53,6 +70,7 @@ export function resolveTables(
           table: config.table,
           primaryKey: config.primaryKey ?? 'id',
           access: config.access ?? 'authenticated',
+          ...(config.cursor ? { cursor: config.cursor } : {}),
         },
       ];
     }),
@@ -358,10 +376,10 @@ export async function reconcileUser(
       await tx.sql`DELETE FROM supapower.changes WHERE table_name = ${table}`;
     }
 
-    await clearSyncedIncomingAt(
-      tx,
-      owned.map(({ table }) => table),
-    );
+    const names = owned.map(({ table }) => table);
+
+    await clearSyncedIncomingAt(tx, names);
+    await clearSyncedCursorAt(tx, names);
 
     await setSyncedUser(tx, user);
   });
@@ -389,14 +407,24 @@ function asInsertEvent(
 async function downloadTable(
   pg: PGliteInterface,
   supabase: SupabaseClient,
-  { table, primaryKey }: ResolvedTableConfig,
+  { table, primaryKey, cursor }: ResolvedTableConfig,
   signal: AbortSignal,
 ): Promise<void> {
   // Taken before the request so a change made while it is in flight is dated
   // after the snapshot rather than swallowed by it.
   const snapshotAt = new Date().toISOString();
 
-  const { data, error } = await supabase.from(table).select();
+  const watermark = cursor ? await getSyncedCursorAt(pg, table) : null;
+  const since = watermark === null ? Number.NaN : Date.parse(watermark);
+
+  // Where an incremental download starts: {@link CURSOR_MARGIN_MS} further back
+  // than the last value seen. A watermark that is not a timestamp gives up and
+  // pulls the whole table rather than guessing at how to step back from it.
+  const from = Number.isNaN(since) ? null : new Date(since - CURSOR_MARGIN_MS).toISOString();
+
+  const select = supabase.from(table).select();
+
+  const { data, error } = await (cursor && from ? select.gte(cursor, from) : select);
 
   if (error) {
     throw new SupapowerError(`Could not download "${table}" from Supabase: ${error.message}`, {
@@ -412,8 +440,37 @@ async function downloadTable(
   // One transaction for the whole table: a half applied snapshot is worse than
   // no snapshot, and it keeps the per row round trips off the shared worker.
   await pg.transaction(async (tx) => {
+    let highest: string | null = null;
+
+    // Seeded with the value already stored, so the same comparison that finds
+    // the furthest along row also keeps the watermark moving only forwards: a
+    // hard deleted row can drag the highest value in the table backwards, and
+    // reaching further back next time is pointless.
+    let highestAt = Number.isNaN(since) ? Number.NEGATIVE_INFINITY : since;
+
     for (const row of data) {
       await handleIncomingChange(tx, asInsertEvent(table, row, snapshotAt), primaryKey);
+
+      if (cursor === undefined) {
+        continue;
+      }
+
+      const value = row[cursor];
+
+      if (typeof value !== 'string') {
+        continue;
+      }
+
+      const at = Date.parse(value);
+
+      if (!Number.isNaN(at) && at > highestAt) {
+        highest = value;
+        highestAt = at;
+      }
+    }
+
+    if (highest !== null) {
+      await setSyncedCursorAt(tx, table, highest);
     }
   });
 }
@@ -429,14 +486,14 @@ export interface InitialSyncOptions {
 /**
  * Downloads every row of every table and writes it into the local database.
  *
- * Deliberately naive: it pulls the whole table rather than asking for what
- * changed, so it is a full download on every start. The rows go through the
- * same path as a realtime INSERT, which means the upsert on the primary key
- * makes re-running it harmless.
+ * A table configured with a `cursor` column is only asked for rows at or after
+ * the last value downloaded, less a margin; one without is pulled whole on
+ * every start. Either way the rows go through the same path as a realtime
+ * INSERT, so the upsert on the primary key makes re-running it harmless.
  *
- * It does not delete anything. A row that was removed remotely while this
+ * It does not delete anything. A row that was hard deleted remotely while this
  * client was away still needs {@link reconcileUser} or a remote DELETE event to
- * disappear locally.
+ * disappear locally, which is why soft deletes are the recommendation.
  */
 export async function runInitialSync({
   pg,

@@ -212,7 +212,7 @@ For tables provided as a `string`, they are expected to have a primary key colum
 The initial sync is performed in the specified order of the tables provided in the `tables` array.
 
 > [!NOTE]
-> The initial sync is deliberately naive for now: it downloads every row of every table with `select()` on each start and upserts them on the primary key. It does not ask for only what changed, and it does not delete - a row removed remotely while this client was away only disappears locally on the next truncation or `DELETE` event.
+> The initial sync downloads whole rows and upserts them on the primary key, which makes re-running it harmless. Configure [`cursor`](#table-cursor-configuration) to make it ask for only what changed; without it, every start pulls the whole table. Either way it never deletes - a row hard deleted remotely while this client was away only disappears locally on the next truncation.
 
 ##### `SupapowerSync` - The sync handle
 
@@ -240,11 +240,34 @@ interface SupapowerTableConfig {
    */
   primaryKey?: string;
   /**
+   * Timestamp column that moves on every write, e.g. "updated_at".
+   *
+   * Given one, the download after the first only asks for what changed.
+   */
+  cursor?: string;
+  /**
    * @default "authenticated"
    */
   access?: 'anon' | 'authenticated';
 }
 ```
+
+###### Table `cursor` configuration
+
+Without a `cursor` every start downloads the whole table. Point it at a timestamp column that is set to the current time on every write and the download after the first only asks for rows at or after the last value it saw:
+
+```ts
+{ table: 'todos', cursor: 'updated_at' }
+```
+
+Supabase has no built-in "give me everything since" - the Data API only queries the table as it stands, and Realtime never replays what you missed - so this column is what makes an incremental download possible at all.
+
+Two things to know about it:
+
+- **The download reaches a minute further back than the last value it saw.** A write stamps its timestamp with the transaction's start time but only becomes visible when it commits, so a slow transaction can land a row behind a watermark that has already moved past it. The margin covers transactions up to a minute; anything slower is missed until the table is downloaded whole again.
+- **Hard `DELETE`s cannot be picked up this way.** The row is simply gone, so nothing comes back to say so. Use soft deletes, and read the schema recommendations below.
+
+The watermark is per table and is forgotten whenever the table is truncated, so a user change always starts from a whole download.
 
 ###### Table `access` configuration
 
@@ -271,6 +294,7 @@ await pg.supapower.sync({
     'items', // tracks table "items" with primary key "id"
     { table: 'todos' }, // tracks table "todos" with primary key "id"
     { table: 'tags', primaryKey: 'tag_id' }, // tracks table "tags" with primary key "tag_id"
+    { table: 'notes', cursor: 'updated_at' }, // only downloads what changed since last time
     { table: 'plans', access: 'anon' }, // tracks table "plans" and it will be synced even when a user hasn't signed in
   ],
 });
@@ -398,6 +422,10 @@ Recommendations are for either the client (<kbd>C</kbd>) or the server (<kbd>S</
 - <kbd>C</kbd><kbd>S</kbd> prefer soft deletes over `DELETE` queries, i.e. use a `deleted_at` column or similar and filter all queries with it
   - this recommendation is for the Supabase migrations as well because realtime events for deleted rows are not sent by default (see [Delete events limitation](https://supabase.com/docs/guides/realtime/postgres-changes#delete-events))
   - even if delete events are received via the realtime engine they will only sync to online users, this means that rows deleted by other users while you are offline will still be in your client's database
+  - **bump `updated_at` in the same statement that sets `deleted_at`**, otherwise the deletion never reaches a client that is using [`cursor`](#table-cursor-configuration): an incremental download only asks for rows whose timestamp moved, so a soft delete that leaves `updated_at` alone is invisible to every client that was offline when it happened
+- <kbd>C</kbd><kbd>S</kbd> give every synced table an `updated_at` column maintained by a trigger
+  - a trigger rather than application code, so that no write path can forget it - one missed update is a row that silently stops syncing to offline clients
+  - it is what [`cursor`](#table-cursor-configuration) needs to turn the full download on every start into an incremental one
 - <kbd>C</kbd><kbd>S</kbd> use uuid's as primary keys
   - as the primary key is shared between the client and server databases and can be created at any end they shouldn't be able to collide, which is why a sequence number won't work
 - <kbd>C</kbd><kbd>S</kbd> have a single primary key in every table that you want to sync

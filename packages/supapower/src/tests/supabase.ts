@@ -48,7 +48,7 @@ export interface FakeSupabase {
   from(table: string): {
     upsert(): Promise<{ error: ResponseError | null }>;
     delete(): { eq(): Promise<{ error: ResponseError | null }> };
-    select(): Promise<{ data: Array<Record<string, unknown>>; error: ResponseError | null }>;
+    select(): FakeSelect;
   };
   channel(name: string): FakeRealtimeChannel;
   removeChannel(channel: FakeRealtimeChannel): Promise<'ok'>;
@@ -57,6 +57,16 @@ export interface FakeSupabase {
   setUser(userId: string | null): void;
   /** Emits `TOKEN_REFRESHED` for the current session, as auth-js does hourly. */
   refreshToken(): void;
+}
+
+interface SelectResult {
+  data: Array<Record<string, unknown>>;
+  error: ResponseError | null;
+}
+
+/** A thenable query builder, the shape PostgREST's own builder has. */
+export interface FakeSelect extends PromiseLike<SelectResult> {
+  gte(column: string, value: string): FakeSelect;
 }
 
 type AuthCallback = (event: string, session: { user: { id: string } } | null) => void;
@@ -84,6 +94,52 @@ export function asSupabaseClient(supabase: FakeSupabase): SupabaseClient {
 }
 
 const ignoreStatus = (_status: SubscribeStatus, _error?: Error): void => {};
+
+/**
+ * Records the query only once it is awaited, so a `.gte()` added after
+ * `select()` still shows up in `calls`.
+ */
+function createSelect(
+  table: string,
+  rows: Array<Record<string, unknown>>,
+  downloadError: (table: string) => ResponseError | null,
+  calls: string[],
+): FakeSelect {
+  let filter: string | undefined;
+  let from: string | undefined;
+
+  const select: FakeSelect = {
+    gte(column, value) {
+      filter = column;
+      from = value;
+
+      return select;
+    },
+    // PostgREST's query builder is itself thenable, which is what this stands in for.
+    // oxlint-disable-next-line unicorn/no-thenable
+    then(onResolved, onRejected) {
+      const column = filter;
+      const lowest = from;
+
+      calls.push(column === undefined ? `select:${table}` : `select:${table}:gte(${column})`);
+
+      const error = downloadError(table);
+
+      const matching =
+        column === undefined || lowest === undefined
+          ? rows
+          : rows.filter((row) => {
+              const value = row[column];
+
+              return typeof value === 'string' && value >= lowest;
+            });
+
+      return Promise.resolve({ data: error ? [] : matching, error }).then(onResolved, onRejected);
+    },
+  };
+
+  return select;
+}
 
 function createChannel(name: string): FakeRealtimeChannel {
   const handlers = new Map<string, (payload: ChangePayload) => void>();
@@ -184,13 +240,7 @@ export function createFakeSupabase({
     from: (table: string) => ({
       upsert: () => record(`upsert:${table}`),
       delete: () => ({ eq: () => record(`delete:${table}`) }),
-      select: () => {
-        calls.push(`select:${table}`);
-
-        const error = downloadError(table);
-
-        return Promise.resolve({ data: error ? [] : (rows[table] ?? []), error });
-      },
+      select: () => createSelect(table, rows[table] ?? [], downloadError, calls),
     }),
     channel(name) {
       const created = createChannel(name);

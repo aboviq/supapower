@@ -167,3 +167,149 @@ describe('reconcileUser', () => {
     expect(pg.metadata.get('SyncedUser')).toBeNull();
   });
 });
+
+describe('runInitialSync - incremental with a cursor', () => {
+  const incremental = resolveTables([
+    { table: 'todos', cursor: 'updated_at' },
+    { table: 'plans', access: 'anon' },
+  ]);
+
+  const rows = {
+    todos: [
+      { id: 1, updated_at: '2026-01-01T10:00:00.000Z' },
+      { id: 2, updated_at: '2026-01-01T12:00:00.000Z' },
+    ],
+  };
+
+  test('pulls the whole table the first time', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase({ rows });
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables: incremental,
+      signal: live(),
+    });
+
+    expect(supabase.calls).toEqual(['select:todos', 'select:plans']);
+    expect(pg.metadata.get('SyncedCursorAt')).toEqual({ todos: '2026-01-01T12:00:00.000Z' });
+  });
+
+  test('asks only for what is new the next time', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase({ rows });
+
+    const run = () =>
+      runInitialSync({
+        pg: asPGlite(pg),
+        supabase: asSupabaseClient(supabase),
+        tables: incremental,
+        signal: live(),
+      });
+
+    await run();
+    await run();
+
+    expect(supabase.calls).toEqual([
+      'select:todos',
+      'select:plans',
+      'select:todos:gte(updated_at)',
+      // No cursor configured, so this one is still pulled whole.
+      'select:plans',
+    ]);
+  });
+
+  test('reaches back beyond the last value it saw', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase({ rows });
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables: incremental,
+      signal: live(),
+    });
+
+    const insertsOfTodos = () =>
+      pg.statements.filter((statement) => statement.includes('INSERT INTO "public"."todos"'))
+        .length;
+
+    const before = insertsOfTodos();
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables: incremental,
+      signal: live(),
+    });
+
+    // The 12:00 row comes back: the margin covers a transaction that stamped
+    // itself before the watermark but committed after it.
+    expect(insertsOfTodos() - before).toBe(1);
+  });
+
+  test('never moves the watermark backwards', async () => {
+    const pg = createFakePGlite();
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(createFakeSupabase({ rows })),
+      tables: incremental,
+      signal: live(),
+    });
+
+    // As if the newest row had been hard deleted upstream.
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(
+        createFakeSupabase({
+          rows: { todos: [{ id: 1, updated_at: '2026-01-01T10:00:00.000Z' }] },
+        }),
+      ),
+      tables: incremental,
+      signal: live(),
+    });
+
+    expect(pg.metadata.get('SyncedCursorAt')).toEqual({ todos: '2026-01-01T12:00:00.000Z' });
+  });
+
+  test('falls back to a whole table when the cursor is not a timestamp', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase({ rows: { todos: [{ id: 1, updated_at: 'v7' }] } });
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables: incremental,
+      signal: live(),
+    });
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables: incremental,
+      signal: live(),
+    });
+
+    expect(supabase.calls.filter((call) => call.startsWith('select:todos'))).toEqual([
+      'select:todos',
+      'select:todos',
+    ]);
+  });
+
+  test('forgets the cursor for tables it empties on a user change', async () => {
+    const pg = createFakePGlite();
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(createFakeSupabase({ rows })),
+      tables: incremental,
+      signal: live(),
+    });
+
+    await reconcileUser(asPGlite(pg), incremental, 'user-a');
+
+    expect(pg.metadata.get('SyncedCursorAt')).toEqual({});
+  });
+});
