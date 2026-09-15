@@ -11,9 +11,9 @@ local PGlite database in sync with Supabase inspired by PowerSync.
 
 Supapower is using [Supabase's Data API and JavaScript client](https://supabase.com/docs/reference/javascript) for syncing outgoing changes to Supabase, i.e. syncing local PGlite table changes to remote tables in Supabase's PostgreSQL database.
 
-The Data API is also used for initially syncing data.
+Local writes to tracked tables are recorded by statement triggers into a `supapower.changes` queue, one row per change, grouped by the transaction they were made in. The queue is drained in order, one local transaction at a time, but each change in a transaction is sent individually to Supabase as the API doesn't support transactions.
 
-After the initial sync the local PGlite tables are kept up to date via [Supabase's Realtime](https://supabase.com/docs/guides/realtime) engine.
+The Data API is also used for initially syncing data, and after the initial sync the local PGlite tables are kept up to date via [Supabase's Realtime](https://supabase.com/docs/guides/realtime) engine.
 
 > [!IMPORTANT]
 > For all tables you want to sync both the Data API and Realtime must be enabled.
@@ -160,15 +160,19 @@ Creates a `supapower` schema in the database with a generic `supapower.changes` 
 
 For each tracked table a statement trigger is attached for `INSERT`, `UPDATE` and `DELETE` operations that adds a row to sync to the `supapower.changes` table.
 
-When the database is set up the sync is started. An initial sync is performed once and then the `supapower.changes` table is periodically queried and synced using the provided `supabase` client.
+When the database is set up the sync is started. The outgoing queue is drained one local transaction at a time using the provided `supabase` client, and the loop is woken by a `NOTIFY` from the change trigger rather than by polling.
 
-A realtime channel subscription is also set up on the provided `supabase` client to track remote changes to the tracked tables.
+A realtime channel subscription is also set up on the provided `supabase` client to track remote changes to the tracked tables. Incoming changes are applied in the order they were broadcast, with the change triggers suppressed so an incoming change is not queued straight back up as an outgoing one.
+
+Call it in **every** tab. The schema has to exist wherever writes happen, and the tab in charge of draining the queue may change at any time - see [Multi-tab behavior](#multi-tab-behavior) below.
 
 #### Type signature
 
 ```ts
-function supapower.sync(options: SupapowerSyncOptions): void;
+function supapower.sync(options: SupapowerSyncOptions): Promise<SupapowerSync>;
 ```
+
+The returned promise resolves once the schema is in place and the sync has been started, not once anything has been synced.
 
 #### Related types
 
@@ -180,14 +184,46 @@ interface SupapowerSyncOptions {
   tables: Array<SupapowerTableConfig | string>;
   /**
    * An optional AbortSignal to cancel the synchronization process.
+   *
+   * Aborting it is equivalent to calling `unsubscribe()`.
    */
   signal?: AbortSignal;
+  /**
+   * Scopes the cross-tab lock that keeps a single tab in charge of the queue.
+   *
+   * Only used for a plain `PGlite` instance - see "Multi-tab behavior".
+   *
+   * @default "default"
+   */
+  scope?: string;
+  /**
+   * Decides what happens to a batch Supabase rejects for good.
+   *
+   * @default Discards the batch.
+   */
+  onUnrecoverableError?: (context: UnrecoverableUploadError) => void | Promise<void>;
 }
 ```
 
 For tables provided as a `string`, they are expected to have a primary key column named `"id"`. To use another primary key column name, use the `{ table: string; primaryKey?: string }` notation.
 
 The initial sync is performed in the specified order of the tables provided in the `tables` array.
+
+##### `SupapowerSync` - The sync handle
+
+```ts
+interface SupapowerSync {
+  /**
+   * How the single active syncer is elected across tabs and processes.
+   */
+  readonly leadership: 'worker-leader' | 'web-lock' | 'single-process';
+  /**
+   * Stops the synchronization process. Local changes are still
+   * tracked. Safe to call more than once.
+   */
+  unsubscribe(): void;
+}
+```
 
 ##### `SupapowerTableConfig` - Tracked tables configuration
 
@@ -205,17 +241,24 @@ interface SupapowerTableConfig {
 }
 ```
 
-**Table `access` configuration**
+###### Table `access` configuration
 
 The `access` configuration for a table controls what happens when a user signs in or out from Supabase (via the [`supabase.auth` API](https://supabase.com/docs/guides/auth)).
 
 - `authenticated` (default) - truncates the table on user sign in and sign out, i.e. it's expected to be user dependent and won't be synced at all if there is no authenticated user
 - `anon` - never truncates the table and it's synced even when there's no authenticated user
 
+The realtime subscription follows this setting: `anon` tables are subscribed to at all times, the rest only while somebody is signed in. It is rebuilt when the signed in user changes, and deliberately left alone when only the access token was refreshed - supabase-js pushes a refreshed token onto the realtime socket by itself, so re-subscribing would drop messages for nothing.
+
+A client created with the [`accessToken` option](https://supabase.com/docs/reference/javascript/initializing) owns its own token and has no auth state to follow, so all of its tables are treated as reachable.
+
+> [!NOTE]
+> The truncation is not implemented yet. Signing out narrows the realtime subscription, but rows the previous user could see stay in the local database.
+
 **Example:**
 
 ```ts
-pg.supapower.sync({
+await pg.supapower.sync({
   supabase,
   tables: [
     'items', // tracks table "items" with primary key "id"
@@ -224,6 +267,107 @@ pg.supapower.sync({
     { table: 'plans', access: 'anon' }, // tracks table "plans" and it will be synced even when a user hasn't signed in
   ],
 });
+```
+
+### Multi-tab behavior
+
+Every tab that opens the same PGlite database shares one set of files, and therefore one
+`supapower.changes` queue. Exactly one tab may drain it, otherwise the same batch is pushed twice.
+
+That lock cannot live in Postgres. PGlite is a single-connection engine and every tab runs its own
+instance, so `pg_advisory_lock()` is invisible to the other tabs and would block the only connection
+this one has. Supapower coordinates in the browser instead, and picks the strongest mechanism the
+runtime offers:
+
+| `leadership`     | When                                   | Mechanism                                                                                                                  |
+| ---------------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `worker-leader`  | The database is a `PGliteWorker`       | PGlite's own leader election - the tab that hosts the database                                                             |
+| `web-lock`       | A plain `PGlite` instance in a browser | An exclusive [Web Lock](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) named `supapower:outgoing:<scope>` |
+| `single-process` | Node, Bun, Deno                        | None - a second process is assumed not to exist                                                                            |
+
+Leadership is handed over on its own: a Web Lock is released by the browser when the tab closes or
+crashes, and `PGliteWorker` re-runs its election. The waiting tab takes over and resumes draining
+where the previous one left off. Read `sync.leadership` to see which mechanism you ended up with.
+
+> [!IMPORTANT]
+> Use the [multi-tab worker](https://pglite.dev/docs/multi-tab-worker) as shown in [step 2](#2-set-up-pglite).
+> Opening a plain `PGlite` instance against the same `dataDir` from several tabs risks corrupting the
+> database no matter what Supapower does with the queue, the `web-lock` strategy only keeps two tabs from
+> pushing the same changes.
+
+### Error handling
+
+A failed upload is one of two things, and Supapower treats them differently.
+
+**Transient** - offline, a 5xx, a dropped connection. The batch stays queued and is retried with an
+exponential backoff, from 1 second up to a minute.
+
+**Unrecoverable** - a data type mismatch (Postgres class `22`), an integrity constraint violation
+(class `23`) or a row-level security denial (`42501`). Supabase will reject these the same way every
+time, and because the queue is strictly ordered the batch would block every later change behind it
+forever. By default Supapower discards the whole batch to keep the queue moving.
+
+Override that with `onUnrecoverableError` when losing the data is not acceptable:
+
+```ts
+import type { UnrecoverableUploadError } from 'supapower/changes';
+
+const sync = await pg.supapower.sync({
+  supabase,
+  tables: ['todos'],
+  onUnrecoverableError: async ({ error, batch, change, commit }) => {
+    await reportToSentry(error, { change });
+    await saveForLater(batch);
+    await commit(); // drops the batch from the queue
+  },
+});
+```
+
+```ts
+interface UnrecoverableUploadError {
+  /** The error Supabase returned, as the cause of a `SupapowerUploadError`. */
+  readonly error: unknown;
+  /** Every change in the local transaction that failed, in order. */
+  readonly batch: Readonly<ChangeRow[]>;
+  /** The change that was rejected. */
+  readonly change: ChangeRow;
+  /** Drops the whole batch from the outgoing queue. */
+  readonly commit: () => Promise<void>;
+}
+```
+
+Returning without calling `commit()` leaves the batch queued, and the sync retries it after a
+backoff - use that to park a batch rather than lose it, but expect the callback to fire again.
+
+> [!CAUTION]
+> Discarding is not a rollback. The changes **before** the rejected one in the batch are already
+> upstream, so dropping the batch leaves that transaction half applied in Supabase with nothing
+> locally to say so. Treat `onUnrecoverableError` as the last chance to notice a divergence.
+
+Uploads are idempotent by design - `upsert` on the primary key, `delete` by primary key - because a
+crash between the upload and the queue delete leaves the batch queued for the next leader to send
+again.
+
+### Entry points
+
+Everything needed for the common case is on the package root. The rest is split per module so that
+go-to-definition lands on the definition rather than on a re-export.
+
+| Import                 | Contains                                                                               |
+| ---------------------- | -------------------------------------------------------------------------------------- |
+| `supapower`            | `supapower` (the extension), `createSupapower`                                         |
+| `supapower/types`      | `SupapowerSyncOptions`, `SupapowerSync`, `SupapowerTableConfig`, `PGliteWithSupapower` |
+| `supapower/changes`    | `ChangeRow`, `UnrecoverableUploadError`, `SyncTransaction`                             |
+| `supapower/errors`     | `SupapowerError`, `SupapowerUploadError`, `isUnrecoverableUploadError`                 |
+| `supapower/leadership` | `createLeadership` and the individual strategies                                       |
+
+`createSupapower(pg)` is the same code path as the extension, for when registering an extension is
+not an option:
+
+```ts
+import { createSupapower } from 'supapower';
+
+const sync = await createSupapower(pg).sync({ supabase, tables: ['todos'] });
 ```
 
 ## Database migrations
