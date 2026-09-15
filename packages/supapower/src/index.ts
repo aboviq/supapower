@@ -4,6 +4,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { createLeadership } from './leadership.js';
 import { runMigrations, trackTables } from './migrations.js';
 import {
+  reconcileUser,
   type ResolvedTableConfig,
   resolveTables,
   runIncomingSync,
@@ -13,6 +14,9 @@ import type { SupapowerNamespace, SupapowerSync, SupapowerSyncOptions } from './
 
 /** Stands in for a client whose token the application owns. */
 const EXTERNAL_AUTH = Symbol('external-auth');
+
+/** What {@link EXTERNAL_AUTH} is recorded as, so a reload recognises it again. */
+const EXTERNAL_USER = 'supapower:external';
 
 /** Who the tables are being synced for. `null` means nobody is signed in. */
 type AuthIdentity = string | null | typeof EXTERNAL_AUTH;
@@ -77,12 +81,25 @@ function superviseIncomingSync({ pg, supabase, tables, signal }: IncomingSupervi
     running?.abort();
     running = new AbortController();
 
-    void runIncomingSync({
-      pg,
-      supabase,
-      tables: next === null ? anonymous : tables,
-      signal: running.signal,
-    });
+    const session = running.signal;
+
+    void (async () => {
+      // Clears out the previous user's rows before anything is downloaded for
+      // this one. Reads the user the local data was last synced for from the
+      // database, so it also catches a reload with somebody else signed in.
+      await reconcileUser(pg, tables, next === EXTERNAL_AUTH ? EXTERNAL_USER : next);
+
+      if (session.aborted) {
+        return;
+      }
+
+      await runIncomingSync({
+        pg,
+        supabase,
+        tables: next === null ? anonymous : tables,
+        signal: session,
+      });
+    })();
   };
 
   const stopWatching = watchAuthIdentity(supabase, restart);

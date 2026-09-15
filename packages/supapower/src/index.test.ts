@@ -255,3 +255,101 @@ describe('createSupapower().sync - incoming subscription', () => {
     sync.unsubscribe();
   });
 });
+
+describe('createSupapower().sync - initial download', () => {
+  const tables = ['todos', { table: 'plans', access: 'anon' as const }];
+
+  const start = async (supabase: FakeSupabase, pg: FakePGlite) => {
+    const sync = await createSupapower(asPGlite(pg)).sync({
+      supabase: asSupabaseClient(supabase),
+      tables,
+    });
+
+    await settle();
+
+    return sync;
+  };
+
+  test('downloads only the anon tables while nobody is signed in', async () => {
+    const pg = createFakeWorkerPGlite({ isLeader: true });
+    const supabase = createFakeSupabase();
+
+    const sync = await start(supabase, pg);
+
+    expect(await waitFor(() => supabase.calls.includes('select:plans'))).toBe(true);
+    expect(supabase.calls).not.toContain('select:todos');
+
+    sync.unsubscribe();
+  });
+
+  test('downloads every table once a user is signed in', async () => {
+    const pg = createFakeWorkerPGlite({ isLeader: true });
+    const supabase = createFakeSupabase({ user: 'user-a', rows: { todos: [{ id: 1 }] } });
+
+    const sync = await start(supabase, pg);
+
+    expect(await waitFor(() => supabase.calls.includes('select:plans'))).toBe(true);
+    expect(supabase.calls).toEqual(['select:todos', 'select:plans']);
+    expect(pg.statements.some((s) => s.includes('INSERT INTO "public"."todos"'))).toBe(true);
+
+    sync.unsubscribe();
+  });
+
+  test('empties and re-downloads the authenticated tables when the user changes', async () => {
+    const pg = createFakeWorkerPGlite({ isLeader: true });
+    const supabase = createFakeSupabase({ user: 'user-a' });
+
+    const sync = await start(supabase, pg);
+
+    await waitFor(() => supabase.calls.includes('select:plans'));
+
+    supabase.setUser('user-b');
+
+    expect(await waitFor(() => pg.truncated.length > 0)).toBe(true);
+    expect(pg.truncated).toEqual(['todos']);
+    expect(
+      await waitFor(() => supabase.calls.filter((c) => c === 'select:todos').length === 2),
+    ).toBe(true);
+
+    sync.unsubscribe();
+  });
+
+  test('empties the authenticated tables on sign out and does not re-download them', async () => {
+    const pg = createFakeWorkerPGlite({ isLeader: true });
+    const supabase = createFakeSupabase({ user: 'user-a' });
+
+    const sync = await start(supabase, pg);
+
+    await waitFor(() => supabase.calls.includes('select:plans'));
+    supabase.setUser(null);
+
+    expect(await waitFor(() => pg.truncated.includes('todos'))).toBe(true);
+    await settle();
+
+    expect(supabase.calls.filter((call) => call === 'select:todos')).toHaveLength(1);
+
+    sync.unsubscribe();
+  });
+
+  test('leaves everything alone when only the token was refreshed', async () => {
+    const pg = createFakeWorkerPGlite({ isLeader: true });
+    const supabase = createFakeSupabase({ user: 'user-a' });
+
+    const sync = await start(supabase, pg);
+
+    await waitFor(() => supabase.calls.includes('select:plans'));
+
+    // The first sync for a user always truncates once, to clear out whoever
+    // was there before; the refresh must not add to that.
+    const before = [...supabase.calls];
+    const truncatedBefore = [...pg.truncated];
+
+    supabase.refreshToken();
+    await settle();
+
+    expect(pg.truncated).toEqual(truncatedBefore);
+    expect(supabase.calls).toEqual(before);
+
+    sync.unsubscribe();
+  });
+});

@@ -14,6 +14,10 @@ export interface FakePGlite {
   readonly statements: string[];
   /** The rows still waiting in `supapower.changes`. */
   readonly queue: ChangeRow[];
+  /** `supapower.metadata`, so watermarks and the synced user round-trip. */
+  readonly metadata: Map<string, unknown>;
+  /** Tables that have been `TRUNCATE`d, in order. */
+  readonly truncated: string[];
   readonly waitReady: Promise<void>;
   sql: FakeSql;
   query: FakeQuery;
@@ -49,6 +53,8 @@ export function asPGlite(pg: FakePGlite): PGliteInterface {
 function createBase({ changes = [] }: FakePGliteOptions): FakePGlite {
   const statements: string[] = [];
   const queue = [...changes];
+  const metadata = new Map<string, unknown>();
+  const truncated: string[] = [];
 
   const sql: FakeSql = (strings, ...values) => {
     const text = strings.join('?').replaceAll(/\s+/g, ' ').trim();
@@ -66,18 +72,64 @@ function createBase({ changes = [] }: FakePGliteOptions): FakePGlite {
     }
 
     if (text.startsWith('DELETE FROM supapower.changes')) {
+      const matches = text.includes('table_name = ?')
+        ? (row: ChangeRow) => row.table_name === values[0]
+        : (row: ChangeRow) => row.tx_id === values[0];
+
       for (let index = queue.length - 1; index >= 0; index -= 1) {
-        if (queue[index]?.tx_id === values[0]) {
+        const row = queue[index];
+
+        if (row && matches(row)) {
           queue.splice(index, 1);
         }
       }
+    }
+
+    if (text.startsWith('SELECT value FROM supapower.metadata')) {
+      const key = String(values[0]);
+
+      return Promise.resolve({
+        rows: metadata.has(key) ? [{ value: metadata.get(key) }] : [],
+      });
+    }
+
+    if (text.startsWith('INSERT INTO supapower.metadata')) {
+      const key = String(values[0]);
+      const value: unknown = JSON.parse(String(values[1]));
+
+      // The real statement either merges the object in or replaces it outright.
+      if (text.includes('metadata.value || EXCLUDED.value')) {
+        metadata.set(key, { ...(metadata.get(key) as object), ...(value as object) });
+      } else {
+        metadata.set(key, value);
+      }
+    }
+
+    if (text.startsWith('UPDATE supapower.metadata')) {
+      const key = String(values[1]);
+      const dropped = new Set(values[0] as string[]);
+      const current = { ...(metadata.get(key) as Record<string, unknown>) };
+
+      for (const name of dropped) {
+        delete current[name];
+      }
+
+      metadata.set(key, current);
     }
 
     return Promise.resolve({ rows: [] });
   };
 
   const query: FakeQuery = (text) => {
-    statements.push(text.replaceAll(/\s+/g, ' ').trim());
+    const statement = text.replaceAll(/\s+/g, ' ').trim();
+
+    statements.push(statement);
+
+    const truncating = /^TRUNCATE TABLE "[^"]+"\."([^"]+)"/.exec(statement);
+
+    if (truncating?.[1]) {
+      truncated.push(truncating[1]);
+    }
 
     return Promise.resolve({ rows: [] });
   };
@@ -85,6 +137,8 @@ function createBase({ changes = [] }: FakePGliteOptions): FakePGlite {
   return {
     statements,
     queue,
+    metadata,
+    truncated,
     waitReady: Promise.resolve(),
     sql,
     query,

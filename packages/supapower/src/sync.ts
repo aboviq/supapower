@@ -6,6 +6,7 @@ import type { PGliteInterface, Transaction } from '@electric-sql/pglite';
 import {
   REALTIME_SUBSCRIBE_STATES,
   type RealtimePostgresChangesPayload,
+  type RealtimePostgresInsertPayload,
   type SupabaseClient,
 } from '@supabase/supabase-js';
 
@@ -16,7 +17,12 @@ import {
 } from './changes.js';
 import { CHANGES_CHANNEL } from './constants.js';
 import { isUnrecoverableUploadError, SupapowerError, SupapowerUploadError } from './errors.js';
-import { setSyncedIncomingAt } from './metadata.js';
+import {
+  clearSyncedIncomingAt,
+  getSyncedUser,
+  setSyncedIncomingAt,
+  setSyncedUser,
+} from './metadata.js';
 import type { SupapowerTableConfig } from './types.js';
 import { escapeIdentifier, executeInTransaction } from './utils.js';
 
@@ -316,6 +322,137 @@ async function handleIncomingChange(
   });
 }
 
+/**
+ * Drops every row the previous user could see, if the user has changed.
+ *
+ * Tables left on the default `authenticated` access hold data that belongs to
+ * whoever was signed in, so signing in or out has to clear them. Tables marked
+ * `anon` are readable by everybody and are left alone.
+ *
+ * Queued outgoing changes for those tables go with them: they were made by the
+ * previous user and cannot be pushed as the next one. Unsynced local work is
+ * lost, which is the price of the `authenticated` setting.
+ *
+ * @param user The user the local data should belong to, `null` for nobody.
+ * @returns Whether anything was dropped.
+ */
+export async function reconcileUser(
+  pg: PGliteInterface,
+  tables: Map<string, ResolvedTableConfig>,
+  user: string | null,
+): Promise<boolean> {
+  const previous = await getSyncedUser(pg);
+
+  if (previous === user) {
+    return false;
+  }
+
+  const owned = [...tables.values()].filter((config) => config.access === 'authenticated');
+
+  await pg.transaction(async (tx) => {
+    for (const { table } of owned) {
+      // TRUNCATE only fires TRUNCATE triggers, so this does not queue itself up
+      // as a pile of outgoing deletes.
+      await tx.query(`TRUNCATE TABLE ${escapeIdentifier('public', table)}`);
+
+      await tx.sql`DELETE FROM supapower.changes WHERE table_name = ${table}`;
+    }
+
+    await clearSyncedIncomingAt(
+      tx,
+      owned.map(({ table }) => table),
+    );
+
+    await setSyncedUser(tx, user);
+  });
+
+  return owned.length > 0;
+}
+
+/** Dresses a downloaded row up as the INSERT event it would have been. */
+function asInsertEvent(
+  table: string,
+  row: Record<string, unknown>,
+  snapshotAt: string,
+): RealtimePostgresInsertPayload<Record<string, unknown>> {
+  return {
+    eventType: 'INSERT',
+    schema: 'public',
+    table,
+    commit_timestamp: snapshotAt,
+    new: row,
+    old: {},
+    errors: [],
+  };
+}
+
+async function downloadTable(
+  pg: PGliteInterface,
+  supabase: SupabaseClient,
+  { table, primaryKey }: ResolvedTableConfig,
+  signal: AbortSignal,
+): Promise<void> {
+  // Taken before the request so a change made while it is in flight is dated
+  // after the snapshot rather than swallowed by it.
+  const snapshotAt = new Date().toISOString();
+
+  const { data, error } = await supabase.from(table).select();
+
+  if (error) {
+    throw new SupapowerError(`Could not download "${table}" from Supabase: ${error.message}`, {
+      code: 'download_failed',
+      cause: error,
+    });
+  }
+
+  if (signal.aborted || data.length === 0) {
+    return;
+  }
+
+  // One transaction for the whole table: a half applied snapshot is worse than
+  // no snapshot, and it keeps the per row round trips off the shared worker.
+  await pg.transaction(async (tx) => {
+    for (const row of data) {
+      await handleIncomingChange(tx, asInsertEvent(table, row, snapshotAt), primaryKey);
+    }
+  });
+}
+
+export interface InitialSyncOptions {
+  pg: PGliteInterface;
+  supabase: SupabaseClient;
+  /** The tables to download, in the order they should be downloaded. */
+  tables: Map<string, ResolvedTableConfig>;
+  signal: AbortSignal;
+}
+
+/**
+ * Downloads every row of every table and writes it into the local database.
+ *
+ * Deliberately naive: it pulls the whole table rather than asking for what
+ * changed, so it is a full download on every start. The rows go through the
+ * same path as a realtime INSERT, which means the upsert on the primary key
+ * makes re-running it harmless.
+ *
+ * It does not delete anything. A row that was removed remotely while this
+ * client was away still needs {@link reconcileUser} or a remote DELETE event to
+ * disappear locally.
+ */
+export async function runInitialSync({
+  pg,
+  supabase,
+  tables,
+  signal,
+}: InitialSyncOptions): Promise<void> {
+  for (const config of tables.values()) {
+    if (signal.aborted) {
+      return;
+    }
+
+    await downloadTable(pg, supabase, config, signal);
+  }
+}
+
 export interface IncomingSyncOptions {
   pg: PGliteInterface;
   supabase: SupabaseClient;
@@ -371,7 +508,7 @@ export async function runIncomingSync({
   // the order they were broadcast.
   let applying: Promise<void> = Promise.resolve();
 
-  const apply = (payload: RealtimePostgresChangesPayload<Record<string, unknown>>, key: string) => {
+  const enqueue = (task: () => Promise<void>) => {
     const previous = applying;
 
     applying = (async () => {
@@ -382,13 +519,16 @@ export async function runIncomingSync({
       }
 
       try {
-        await handleIncomingChange(pg, payload, key);
+        await task();
       } catch (error: unknown) {
-        // Caught per change so one bad row cannot break the chain for the rest.
+        // Caught per task so one bad row cannot break the chain for the rest.
         onError?.(error);
       }
     })();
   };
+
+  const apply = (payload: RealtimePostgresChangesPayload<Record<string, unknown>>, key: string) =>
+    enqueue(() => handleIncomingChange(pg, payload, key));
 
   let subscription = supabase.channel(channel);
 
@@ -422,6 +562,11 @@ export async function runIncomingSync({
       );
     });
   });
+
+  // Subscribe first, download second: a change made while the snapshot is in
+  // flight arrives on the open channel and queues up behind it, rather than
+  // falling in the gap between the two.
+  enqueue(() => runInitialSync({ pg, supabase, tables, signal }));
 
   try {
     await closed;

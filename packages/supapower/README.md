@@ -162,7 +162,9 @@ For each tracked table a statement trigger is attached for `INSERT`, `UPDATE` an
 
 When the database is set up the sync is started. The outgoing queue is drained one local transaction at a time using the provided `supabase` client, and the loop is woken by a `NOTIFY` from the change trigger rather than by polling.
 
-A realtime channel subscription is also set up on the provided `supabase` client to track remote changes to the tracked tables. Incoming changes are applied in the order they were broadcast, with the change triggers suppressed so an incoming change is not queued straight back up as an outgoing one.
+A realtime channel subscription is also set up on the provided `supabase` client to track remote changes to the tracked tables, and an initial download brings the local tables up to date behind it. Incoming changes are applied in the order they were broadcast, with the change triggers suppressed so an incoming change is not queued straight back up as an outgoing one.
+
+The channel is subscribed to before the download starts, so a change made while the download is in flight queues up behind the snapshot instead of falling in the gap between the two.
 
 Call it in **every** tab. The schema has to exist wherever writes happen, and the tab in charge of draining the queue may change at any time - see [Multi-tab behavior](#multi-tab-behavior) below.
 
@@ -209,6 +211,9 @@ For tables provided as a `string`, they are expected to have a primary key colum
 
 The initial sync is performed in the specified order of the tables provided in the `tables` array.
 
+> [!NOTE]
+> The initial sync is deliberately naive for now: it downloads every row of every table with `select()` on each start and upserts them on the primary key. It does not ask for only what changed, and it does not delete - a row removed remotely while this client was away only disappears locally on the next truncation or `DELETE` event.
+
 ##### `SupapowerSync` - The sync handle
 
 ```ts
@@ -252,8 +257,10 @@ The realtime subscription follows this setting: `anon` tables are subscribed to 
 
 A client created with the [`accessToken` option](https://supabase.com/docs/reference/javascript/initializing) owns its own token and has no auth state to follow, so all of its tables are treated as reachable.
 
-> [!NOTE]
-> The truncation is not implemented yet. Signing out narrows the realtime subscription, but rows the previous user could see stay in the local database.
+When the signed in user changes - in either direction - the `authenticated` tables are truncated before anything is downloaded for the new one, and the outgoing queue is cleared of their changes too.
+
+> [!CAUTION]
+> Unsynced local writes to `authenticated` tables are lost on sign out. They were made by the previous user and cannot be pushed upstream as the next one, so they go with the rows. Push what matters before signing out.
 
 **Example:**
 

@@ -48,6 +48,7 @@ export interface FakeSupabase {
   from(table: string): {
     upsert(): Promise<{ error: ResponseError | null }>;
     delete(): { eq(): Promise<{ error: ResponseError | null }> };
+    select(): Promise<{ data: Array<Record<string, unknown>>; error: ResponseError | null }>;
   };
   channel(name: string): FakeRealtimeChannel;
   removeChannel(channel: FakeRealtimeChannel): Promise<'ok'>;
@@ -64,6 +65,10 @@ type AuthSubscription = { data: { subscription: { unsubscribe(): void } } };
 export interface FakeSupabaseOptions {
   /** How the n:th write is answered. Defaults to accepting everything. */
   respond?: Respond;
+  /** What `select()` returns per table. Defaults to an empty table. */
+  rows?: Record<string, Array<Record<string, unknown>>>;
+  /** Fails `select()` for the tables it answers for. */
+  downloadError?: (table: string) => ResponseError | null;
   /** Who is signed in to begin with. */
   user?: string | null;
   /**
@@ -123,6 +128,8 @@ function createChannel(name: string): FakeRealtimeChannel {
  */
 export function createFakeSupabase({
   respond = () => null,
+  rows = {},
+  downloadError = () => null,
   user = null,
   auth = true,
 }: FakeSupabaseOptions = {}): FakeSupabase {
@@ -177,6 +184,13 @@ export function createFakeSupabase({
     from: (table: string) => ({
       upsert: () => record(`upsert:${table}`),
       delete: () => ({ eq: () => record(`delete:${table}`) }),
+      select: () => {
+        calls.push(`select:${table}`);
+
+        const error = downloadError(table);
+
+        return Promise.resolve({ data: error ? [] : (rows[table] ?? []), error });
+      },
     }),
     channel(name) {
       const created = createChannel(name);
