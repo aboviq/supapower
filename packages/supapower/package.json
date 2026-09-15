@@ -1,0 +1,76 @@
+{
+  "name": "supapower",
+  "version": "0.0.0",
+  "description": "A sync engine keeping a local PGlite database in sync with Supabase - inspired by PowerSync",
+  "keywords": [
+    "local-first",
+    "offline-first",
+    "pglite",
+    "postgres",
+    "supabase",
+    "sync"
+  ],
+  "homepage": "https://github.com/aboviq/supapower/tree/main/packages/supapower#readme",
+  "bugs": {
+    "url": "https://github.com/aboviq/supapower/issues"
+  },
+  "license": "Apache-2.0",
+  "author": "Aboviq AB",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aboviq/supapower.git",
+    "directory": "packages/supapower"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./changes": {
+      "types": "./dist/changes.d.ts",
+      "default": "./dist/changes.js"
+    },
+    "./errors": {
+      "types": "./dist/errors.d.ts",
+      "default": "./dist/errors.js"
+    },
+    "./leadership": {
+      "types": "./dist/leadership.d.ts",
+      "default": "./dist/leadership.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "default": "./dist/types.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "@supabase/supabase-js": "^2.116.0"
+  },
+  "peerDependencies": {
+    "@electric-sql/pglite": ">=0.5.0 <1.0.0",
+    "@supabase/supabase-js": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

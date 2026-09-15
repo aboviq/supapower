@@ -9,11 +9,15 @@ while offline. It is inspired by [PowerSync](https://www.powersync.com/).
 > **Status:** early groundwork. The repository holds the toolchain and the first package; the sync
 > engine itself is still being built.
 
+## Documentation
+
+Everything below is for working with the monorepo. For documentation on the Supapower library see the [`supapower` package's readme](./packages/supapower/README.md).
+
 ## Packages
 
-| Package | Description |
-| ------- | ----------- |
-| TBD     | ...         |
+| Package                              | Description                                                                                                   |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| [`supapower`](./packages/supapower/) | The main package for Supapower - a PGlite extension that integrates with Supabase and syncs data between them |
 
 ## Requirements
 
