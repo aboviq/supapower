@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
+import { isSupapowerError } from './errors.js';
 import { createSupapower } from './index.js';
 import { settle, waitFor } from './tests/async.js';
 import { createChange } from './tests/changes.js';
@@ -405,5 +406,20 @@ describe('createSupapower().sync - waiting for authentication', () => {
     expect(pg.queue.map((change) => change.table_name)).toEqual(['todos']);
 
     sync.unsubscribe();
+  });
+});
+
+describe('createSupapower().sync - primary key validation', () => {
+  test('refuses to start when a configured primary key is not a column', async () => {
+    const pg = createFakeWorkerPGlite({ isLeader: true, columns: { tags: ['id', 'name'] } });
+
+    const failing = createSupapower(asPGlite(pg)).sync({
+      supabase: idleSupabase,
+      tables: [{ table: 'tags', primaryKey: 'tag_id' }],
+    });
+
+    const thrown = await failing.catch((error: unknown) => error);
+
+    expect(isSupapowerError(thrown) && thrown.code).toBe('schema_mismatch');
   });
 });

@@ -219,7 +219,7 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
       // through its single connection, so the redundant runs are harmless.
       await pg.waitReady;
       await runMigrations(pg);
-      await trackTables(pg, [...configs.keys()]);
+      await trackTables(pg, [...configs.values()]);
 
       if (stopped) {
         return handle; // unsubscribed while the schema was being set up

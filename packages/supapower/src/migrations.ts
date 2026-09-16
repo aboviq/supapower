@@ -1,7 +1,14 @@
 import type { PGliteInterface } from '@electric-sql/pglite';
-import { identifier } from '@electric-sql/pglite/template';
+import { identifier, raw } from '@electric-sql/pglite/template';
 
 import { CHANGES_CHANNEL } from './constants.js';
+import { SupapowerError } from './errors.js';
+
+/** The part of a table's configuration the triggers need. */
+export interface TrackedTable {
+  table: string;
+  primaryKey: string;
+}
 
 export const runMigrations = async (pg: PGliteInterface): Promise<void> => {
   await pg.transaction(async (tx) => {
@@ -31,6 +38,9 @@ export const runMigrations = async (pg: PGliteInterface): Promise<void> => {
     // Create track_table_changes trigger:
     await tx.sql`
       CREATE OR REPLACE FUNCTION supapower.track_table_changes() RETURNS trigger AS $$
+      DECLARE
+        -- The tracked table's primary key, passed in by CREATE TRIGGER.
+        primary_key TEXT := TG_ARGV[0];
       BEGIN
         IF current_setting('supapower.applying', true) = 'true' THEN
           RETURN NULL;
@@ -74,7 +84,7 @@ export const runMigrations = async (pg: PGliteInterface): Promise<void> => {
           FROM
             new_table n
             JOIN old_table o ON
-              o.id = n.id;
+              to_jsonb(o) ->> primary_key = to_jsonb(n) ->> primary_key;
 
         ELSIF TG_OP = 'DELETE' THEN
           INSERT INTO supapower.changes (
@@ -97,7 +107,7 @@ export const runMigrations = async (pg: PGliteInterface): Promise<void> => {
         END IF;
 
         -- Wake whichever tab is currently draining the outgoing queue.
-        PERFORM pg_notify(${CHANGES_CHANNEL}, '');
+        PERFORM pg_notify(${raw`'${CHANGES_CHANNEL}'`}, '');
 
         RETURN NULL;
       END;
@@ -114,29 +124,61 @@ export const runMigrations = async (pg: PGliteInterface): Promise<void> => {
   });
 };
 
-export const trackTables = async (pg: PGliteInterface, tableNames: string[]): Promise<void> => {
+/**
+ * Fails loudly when the configured primary key is not a column of the table.
+ *
+ * The trigger pairs rows through `to_jsonb(row) ->> primary_key`, and a key
+ * that is not there yields `NULL` on both sides of the join. `NULL = NULL` is
+ * false, so every `UPDATE` would go unrecorded without a single error to say
+ * so - which is far worse than refusing to start.
+ */
+const assertPrimaryKey = async (pg: PGliteInterface, { table, primaryKey }: TrackedTable) => {
+  const { rows } = await pg.sql<{ found: number }>`
+    SELECT 1 AS found FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = ${table}
+      AND column_name = ${primaryKey}
+  `;
+
+  if (rows.length === 0) {
+    throw new SupapowerError(
+      `Table "${table}" has no column "${primaryKey}" to use as its primary key`,
+      { code: 'schema_mismatch' },
+    );
+  }
+};
+
+export const trackTables = async (pg: PGliteInterface, tables: TrackedTable[]): Promise<void> => {
   await Promise.all(
-    tableNames.map(async (table) => {
+    tables.map(async (tracked) => {
+      const { table, primaryKey } = tracked;
+
+      await assertPrimaryKey(pg, tracked);
+
+      // A trigger argument is a literal, not a parameter, so it is escaped by
+      // hand. `assertPrimaryKey` has already established it is a real column.
+      const key = raw`'${primaryKey.replaceAll("'", "''")}'`;
+
       await pg.transaction(async (tx) => {
         await tx.sql`
           CREATE OR REPLACE TRIGGER ${identifier`supapower_change_trigger_insert_${table}`}
           AFTER INSERT ON ${identifier`${table}`}
           REFERENCING NEW TABLE AS new_table
-          FOR EACH STATEMENT EXECUTE FUNCTION supapower.track_table_changes();
+          FOR EACH STATEMENT EXECUTE FUNCTION supapower.track_table_changes(${key});
         `;
 
         await tx.sql`
           CREATE OR REPLACE TRIGGER ${identifier`supapower_change_trigger_update_${table}`}
           AFTER UPDATE ON ${identifier`${table}`}
           REFERENCING OLD TABLE AS old_table NEW TABLE AS new_table
-          FOR EACH STATEMENT EXECUTE FUNCTION supapower.track_table_changes();
+          FOR EACH STATEMENT EXECUTE FUNCTION supapower.track_table_changes(${key});
         `;
 
         await tx.sql`
           CREATE OR REPLACE TRIGGER ${identifier`supapower_change_trigger_delete_${table}`}
           AFTER DELETE ON ${identifier`${table}`}
           REFERENCING OLD TABLE AS old_table
-          FOR EACH STATEMENT EXECUTE FUNCTION supapower.track_table_changes();
+          FOR EACH STATEMENT EXECUTE FUNCTION supapower.track_table_changes(${key});
         `;
       });
     }),

@@ -38,6 +38,12 @@ export interface FakeWorkerPGlite extends FakePGlite {
 export interface FakePGliteOptions {
   /** Rows to seed the outgoing queue with. */
   changes?: ChangeRow[];
+  /**
+   * Which columns each table has, for the primary key check `trackTables` runs.
+   *
+   * Left out, every column exists.
+   */
+  columns?: Record<string, string[]>;
 }
 
 export interface FakeWorkerPGliteOptions extends FakePGliteOptions {
@@ -50,7 +56,7 @@ export function asPGlite(pg: FakePGlite): PGliteInterface {
   return pg as unknown as PGliteInterface;
 }
 
-function createBase({ changes = [] }: FakePGliteOptions): FakePGlite {
+function createBase({ changes = [], columns }: FakePGliteOptions): FakePGlite {
   const statements: string[] = [];
   const queue = [...changes];
   const metadata = new Map<string, unknown>();
@@ -99,6 +105,13 @@ function createBase({ changes = [] }: FakePGliteOptions): FakePGlite {
           queue.splice(index, 1);
         }
       }
+    }
+
+    if (text.startsWith('SELECT 1 AS found FROM information_schema.columns')) {
+      const known = columns?.[String(values[0])];
+      const exists = !known || known.includes(String(values[1]));
+
+      return Promise.resolve({ rows: exists ? [{ found: 1 }] : [] });
     }
 
     if (text.startsWith('SELECT value FROM supapower.metadata')) {
