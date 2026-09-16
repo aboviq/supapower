@@ -282,10 +282,11 @@ Without a `cursor` every start downloads the whole table. Point it at a timestam
 
 Supabase has no built-in "give me everything since" - the Data API only queries the table as it stands, and Realtime never replays what you missed - so this column is what makes an incremental download possible at all.
 
-Two things to know about it:
+Three things to know about it:
 
 - **The download reaches a minute further back than the last value it saw.** A write stamps its timestamp with the transaction's start time but only becomes visible when it commits, so a slow transaction can land a row behind a watermark that has already moved past it. The margin covers transactions up to a minute; anything slower is missed until the table is downloaded whole again.
 - **Hard `DELETE`s cannot be picked up this way.** The row is simply gone, so nothing comes back to say so. Use soft deletes, and read the schema recommendations below.
+- **A row that becomes visible without changing is invisible to it.** An incremental download asks for rows whose timestamp moved. Being added to a shared project does not move any timestamp on the project's rows - they were there all along, you just could not see them - so they are never fetched. Realtime does not help either: it only delivers rows that actually change. See the schema recommendations below for what to do about it.
 
 The watermark is per table and records what it is worth: the value, the column it was read from, and the columns the download asked for. Change either and it no longer applies, and the table is pulled whole again - see [schema drift](#schema-drift). It is also forgotten whenever the table is truncated, so a user change always starts from a whole download.
 
@@ -501,6 +502,16 @@ Recommendations are for either the client (<kbd>C</kbd>) or the server (<kbd>S</
 - <kbd>C</kbd><kbd>S</kbd> give every synced table an `updated_at` column maintained by a trigger
   - a trigger rather than application code, so that no write path can forget it - one missed update is a row that silently stops syncing to offline clients
   - it is what [`cursor`](#table-cursor-configuration) needs to turn the full download on every start into an incremental one
+- <kbd>S</kbd> bump `updated_at` on every row whose **visibility** changes, not just every row whose contents change
+  - granting somebody access to a project, moving a document between teams, accepting an invitation: the rows themselves are untouched, so their timestamps do not move, so a client using [`cursor`](#table-cursor-configuration) never asks for them and never learns they exist
+  - realtime does not cover the gap either, since it only delivers rows that actually change
+  - the fix belongs in the statement that changes the access, alongside the membership row itself:
+
+    ```sql
+    UPDATE documents SET updated_at = now() WHERE project_id = new.project_id;
+    ```
+
+  - it is worth doing from a trigger on the membership table so that no code path granting access can forget, and worth keeping in mind when writing row-level security policies: **whatever a policy reads, a change to it has to move the timestamp of every row the policy decides about**
 - <kbd>C</kbd><kbd>S</kbd> use uuid's as primary keys
   - as the primary key is shared between the client and server databases and can be created at any end they shouldn't be able to collide, which is why a sequence number won't work
 - <kbd>C</kbd><kbd>S</kbd> have a single primary key in every table that you want to sync
