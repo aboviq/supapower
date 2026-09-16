@@ -84,9 +84,17 @@ export const setSyncedUser = async (
   `;
 };
 
+export interface CursorWatermark {
+  /** The highest value seen in the cursor column. */
+  at: string;
+  /** The column that value was read from. */
+  cursor: string;
+  /** The columns the download asked for, sorted. */
+  columns: string[];
+}
+
 /**
- * The highest cursor value downloaded for a table, or `null` if it has never
- * been downloaded.
+ * How far a table has been downloaded, or `null` if it never has.
  *
  * Separate from {@link setSyncedIncomingAt}: that one records when this client
  * last saw a change, while this is a value read straight out of the remote
@@ -95,19 +103,19 @@ export const setSyncedUser = async (
 export const getSyncedCursorAt = async (
   pg: PGliteInterface | Transaction,
   table: string,
-): Promise<string | null> => {
-  const { rows } = await pg.sql<{ value: Record<string, string> | null }>`
+): Promise<CursorWatermark | null> => {
+  const { rows } = await pg.sql<{ value: Record<string, CursorWatermark> | null }>`
     SELECT value FROM supapower.metadata WHERE key = ${keys.syncedCursorAt}
   `;
 
   return rows[0]?.value?.[table] ?? null;
 };
 
-/** Records how far a table has been downloaded. */
+/** Records how far a table has been downloaded, and under what. */
 export const setSyncedCursorAt = async (
   pg: PGliteInterface | Transaction,
   table: string,
-  cursorAt: string,
+  watermark: CursorWatermark,
 ): Promise<void> => {
   await pg.sql`
     INSERT INTO supapower.metadata (
@@ -116,7 +124,7 @@ export const setSyncedCursorAt = async (
     )
     VALUES (
       ${keys.syncedCursorAt},
-      ${JSON.stringify({ [table]: cursorAt })}
+      ${JSON.stringify({ [table]: watermark })}
     )
     ON CONFLICT (key) DO UPDATE SET
       value = metadata.value || EXCLUDED.value;

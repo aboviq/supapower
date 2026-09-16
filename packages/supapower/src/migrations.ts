@@ -8,7 +8,42 @@ import { SupapowerError } from './errors.js';
 export interface TrackedTable {
   table: string;
   primaryKey: string;
+  /** The columns the table actually has locally, from {@link readLocalColumns}. */
+  columns: readonly string[];
 }
+
+/**
+ * Reads the columns each table actually has in the local database.
+ *
+ * The local schema is the application's, not Supapower's, and it lags behind
+ * the remote one whenever the server deploys first. Knowing what is there is
+ * what lets an incoming row be trimmed to fit instead of failing to apply.
+ *
+ * @returns The columns per table, sorted, so two readings compare directly.
+ */
+export const readLocalColumns = async (
+  pg: PGliteInterface,
+  tableNames: string[],
+): Promise<Map<string, string[]>> => {
+  const columns = new Map<string, string[]>(tableNames.map((table) => [table, []]));
+
+  if (tableNames.length === 0) {
+    return columns;
+  }
+
+  const { rows } = await pg.sql<{ table_name: string; column_name: string }>`
+    SELECT table_name, column_name FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = ANY(${tableNames}::text[])
+    ORDER BY table_name, column_name
+  `;
+
+  for (const { table_name, column_name } of rows) {
+    columns.get(table_name)?.push(column_name);
+  }
+
+  return columns;
+};
 
 export const runMigrations = async (pg: PGliteInterface): Promise<void> => {
   await pg.transaction(async (tx) => {
@@ -132,15 +167,8 @@ export const runMigrations = async (pg: PGliteInterface): Promise<void> => {
  * false, so every `UPDATE` would go unrecorded without a single error to say
  * so - which is far worse than refusing to start.
  */
-const assertPrimaryKey = async (pg: PGliteInterface, { table, primaryKey }: TrackedTable) => {
-  const { rows } = await pg.sql<{ found: number }>`
-    SELECT 1 AS found FROM information_schema.columns
-    WHERE table_schema = 'public'
-      AND table_name = ${table}
-      AND column_name = ${primaryKey}
-  `;
-
-  if (rows.length === 0) {
+const assertPrimaryKey = ({ table, primaryKey, columns }: TrackedTable) => {
+  if (!columns.includes(primaryKey)) {
     throw new SupapowerError(
       `Table "${table}" has no column "${primaryKey}" to use as its primary key`,
       { code: 'schema_mismatch' },
@@ -148,12 +176,15 @@ const assertPrimaryKey = async (pg: PGliteInterface, { table, primaryKey }: Trac
   }
 };
 
-export const trackTables = async (pg: PGliteInterface, tables: TrackedTable[]): Promise<void> => {
+export const trackTables = async (
+  pg: PGliteInterface,
+  tables: readonly TrackedTable[],
+): Promise<void> => {
   await Promise.all(
     tables.map(async (tracked) => {
       const { table, primaryKey } = tracked;
 
-      await assertPrimaryKey(pg, tracked);
+      assertPrimaryKey(tracked);
 
       // A trigger argument is a literal, not a parameter, so it is escaped by
       // hand. `assertPrimaryKey` has already established it is a real column.

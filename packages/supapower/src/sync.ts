@@ -25,6 +25,7 @@ import {
 import {
   clearSyncedCursorAt,
   clearSyncedIncomingAt,
+  type CursorWatermark,
   getSyncedCursorAt,
   getSyncedUser,
   setSyncedCursorAt,
@@ -52,18 +53,36 @@ const RETRY_MAX_MS = 60_000;
  */
 const CURSOR_MARGIN_MS = 60_000;
 
-/** A table config with the defaults filled in. */
+/** A table config with the defaults filled in and the local schema attached. */
 export interface ResolvedTableConfig {
   table: string;
   primaryKey: string;
   access: 'anon' | 'authenticated';
   /** Timestamp column an incremental download filters on, when there is one. */
   cursor?: string;
+  /**
+   * The columns the table has in the local database, sorted.
+   *
+   * The application owns the local schema, and it lags behind the remote one
+   * whenever the server deploys first, so this is what an incoming row is
+   * trimmed to fit.
+   */
+  columns: readonly string[];
 }
 
-/** Fills in the defaults for a table entry and keys them by table name. */
+/** The table names in a configuration, in the order they were given. */
+export function tableNames(tables: Array<SupapowerTableConfig | string>): string[] {
+  return tables.map((entry) => (typeof entry === 'string' ? entry : entry.table));
+}
+
+/**
+ * Fills in the defaults for a table entry and keys them by table name.
+ *
+ * @param columns The local columns per table, from `readLocalColumns`.
+ */
 export function resolveTables(
   tables: Array<SupapowerTableConfig | string>,
+  columns: Map<string, readonly string[]>,
 ): Map<string, ResolvedTableConfig> {
   return new Map(
     tables.map((entry) => {
@@ -75,6 +94,7 @@ export function resolveTables(
           table: config.table,
           primaryKey: config.primaryKey ?? 'id',
           access: config.access ?? 'authenticated',
+          columns: columns.get(config.table) ?? [],
           ...(config.cursor ? { cursor: config.cursor } : {}),
         },
       ];
@@ -334,12 +354,21 @@ export async function runOutgoingSync({
 export async function handleIncomingChange(
   pg: PGliteInterface | Transaction,
   payload: RealtimePostgresChangesPayload<Record<string, unknown>>,
-  primaryKey: string,
-): Promise<void> {
+  { primaryKey, columns: local }: Pick<ResolvedTableConfig, 'primaryKey' | 'columns'>,
+): Promise<readonly string[]> {
   const columns: string[] = [];
   const parameters: unknown[] = [];
+  const ignored: string[] = [];
 
   for (const [column, value] of Object.entries(payload.new)) {
+    // A column the server has and this client does not. Naming it in the
+    // statement would fail the whole change with 42703, so it is left out and
+    // handed back for the caller to report.
+    if (!local.includes(column)) {
+      ignored.push(column);
+      continue;
+    }
+
     columns.push(column);
     parameters.push(value);
   }
@@ -380,6 +409,8 @@ export async function handleIncomingChange(
 
     await setSyncedIncomingAt(tx, payload.table, new Date(payload.commit_timestamp));
   });
+
+  return ignored;
 }
 
 /**
@@ -446,27 +477,56 @@ function asInsertEvent(
   };
 }
 
+/** Quotes a column for a PostgREST `select`, which only needs it sometimes. */
+function selectable(column: string): string {
+  return /^[a-z_][\w$]*$/i.test(column) ? column : `"${column.replaceAll('"', '""')}"`;
+}
+
+/**
+ * Whether a stored watermark still answers the question being asked.
+ *
+ * It was collected from one cursor column, covering one set of columns. Ask
+ * for a column that download never requested and the watermark would skip
+ * every row that has not changed since - so it only holds while the columns
+ * wanted now are ones it already covered.
+ */
+function stillApplies(
+  watermark: CursorWatermark | null,
+  config: ResolvedTableConfig,
+): watermark is CursorWatermark {
+  return (
+    watermark !== null
+    && watermark.cursor === config.cursor
+    && config.columns.every((column) => watermark.columns.includes(column))
+  );
+}
+
 async function downloadTable(
   pg: PGliteInterface,
   supabase: SupabaseClient,
-  { table, primaryKey, cursor }: ResolvedTableConfig,
+  config: ResolvedTableConfig,
   signal: AbortSignal,
 ): Promise<void> {
+  const { table, cursor, columns } = config;
+
   // Taken before the request so a change made while it is in flight is dated
   // after the snapshot rather than swallowed by it.
   const snapshotAt = new Date().toISOString();
 
-  const watermark = cursor ? await getSyncedCursorAt(pg, table) : null;
-  const since = watermark === null ? Number.NaN : Date.parse(watermark);
+  const stored = cursor ? await getSyncedCursorAt(pg, table) : null;
+  const since = stillApplies(stored, config) ? Date.parse(stored.at) : Number.NaN;
 
   // Where an incremental download starts: {@link CURSOR_MARGIN_MS} further back
   // than the last value seen. A watermark that is not a timestamp gives up and
   // pulls the whole table rather than guessing at how to step back from it.
   const from = Number.isNaN(since) ? null : new Date(since - CURSOR_MARGIN_MS).toISOString();
 
-  const select = supabase.from(table).select();
+  // Asking for the columns this client has keeps a column it does not know
+  // about out of the download entirely, rather than trimming it off on arrival.
+  const select = supabase.from(table).select(columns.map(selectable).join(','));
+  const query = cursor && from ? select.gte(cursor, from) : select;
 
-  const { data, error } = await (cursor && from ? select.gte(cursor, from) : select);
+  const { data, error } = await query.returns<Array<Record<string, unknown>>>();
 
   if (error) {
     throw new SupapowerError(`Could not download "${table}" from Supabase: ${error.message}`, {
@@ -491,7 +551,7 @@ async function downloadTable(
     let highestAt = Number.isNaN(since) ? Number.NEGATIVE_INFINITY : since;
 
     for (const row of data) {
-      await handleIncomingChange(tx, asInsertEvent(table, row, snapshotAt), primaryKey);
+      await handleIncomingChange(tx, asInsertEvent(table, row, snapshotAt), config);
 
       if (cursor === undefined) {
         continue;
@@ -511,8 +571,8 @@ async function downloadTable(
       }
     }
 
-    if (highest !== null) {
-      await setSyncedCursorAt(tx, table, highest);
+    if (highest !== null && cursor !== undefined) {
+      await setSyncedCursorAt(tx, table, { at: highest, cursor, columns: [...columns] });
     }
   });
 }
@@ -626,17 +686,44 @@ export async function runIncomingSync({
     })();
   };
 
-  const apply = (payload: RealtimePostgresChangesPayload<Record<string, unknown>>, key: string) =>
-    enqueue(() => handleIncomingChange(pg, payload, key));
+  // Reported once per column per session: a schema that has drifted drifts for
+  // every row, and one notice is the useful part.
+  const reported = new Set<string>();
+
+  const reportIgnored = (table: string, ignored: readonly string[]) => {
+    const fresh = ignored.filter((column) => !reported.has(`${table}.${column}`));
+
+    if (fresh.length === 0) {
+      return;
+    }
+
+    for (const column of fresh) {
+      reported.add(`${table}.${column}`);
+    }
+
+    onError?.(
+      new SupapowerError(
+        `Ignored ${fresh.map((column) => `"${column}"`).join(', ')} from a remote change to "${table}": this client's schema has no such column`,
+        { code: 'column_ignored' },
+      ),
+    );
+  };
+
+  const apply = (
+    payload: RealtimePostgresChangesPayload<Record<string, unknown>>,
+    config: ResolvedTableConfig,
+  ) =>
+    enqueue(async () => {
+      reportIgnored(config.table, await handleIncomingChange(pg, payload, config));
+    });
 
   let subscription = supabase.channel(channel);
 
-  for (const { table, primaryKey } of tables.values()) {
+  for (const config of tables.values()) {
     subscription = subscription.on(
       'postgres_changes',
-      { event: '*', schema: 'public', table },
-      (payload: RealtimePostgresChangesPayload<Record<string, unknown>>) =>
-        apply(payload, primaryKey),
+      { event: '*', schema: 'public', table: config.table },
+      (payload: RealtimePostgresChangesPayload<Record<string, unknown>>) => apply(payload, config),
     );
   }
 

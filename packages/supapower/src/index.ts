@@ -4,13 +4,14 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import type { UnrecoverableUploadError } from './changes.js';
 import type { SupapowerError } from './errors.js';
 import { createLeadership } from './leadership.js';
-import { runMigrations, trackTables } from './migrations.js';
+import { readLocalColumns, runMigrations, trackTables } from './migrations.js';
 import {
   reconcileUser,
   type ResolvedTableConfig,
   resolveTables,
   runIncomingSync,
   runOutgoingSync,
+  tableNames,
 } from './sync.js';
 import type { SupapowerNamespace, SupapowerSync, SupapowerSyncOptions } from './types.js';
 
@@ -187,8 +188,8 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
       onError,
     }: SupapowerSyncOptions): Promise<SupapowerSync> {
       const leadership = createLeadership(pg, scope);
-      const configs = resolveTables(tables);
 
+      let configs = new Map<string, ResolvedTableConfig>();
       let stopLeadership: (() => void) | undefined;
       let stopped = false;
 
@@ -219,6 +220,11 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
       // through its single connection, so the redundant runs are harmless.
       await pg.waitReady;
       await runMigrations(pg);
+
+      // Read after the migrations, so a table the application creates in the
+      // same startup is already there to be described.
+      configs = resolveTables(tables, await readLocalColumns(pg, tableNames(tables)));
+
       await trackTables(pg, [...configs.values()]);
 
       if (stopped) {

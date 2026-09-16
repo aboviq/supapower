@@ -222,7 +222,17 @@ For tables provided as a `string`, they are expected to have a primary key colum
 The initial sync is performed in the specified order of the tables provided in the `tables` array.
 
 > [!NOTE]
-> The initial sync downloads whole rows and upserts them on the primary key, which makes re-running it harmless. Configure [`cursor`](#table-cursor-configuration) to make it ask for only what changed; without it, every start pulls the whole table. Either way it never deletes - a row hard deleted remotely while this client was away only disappears locally on the next truncation.
+> The initial sync asks only for the columns this client's schema has, upserts whole rows on the primary key - which makes re-running it harmless - and never deletes. A row hard deleted remotely while this client was away only disappears locally on the next truncation. Configure [`cursor`](#table-cursor-configuration) to make it ask for only what changed; without it, every start pulls the whole table.
+
+##### Schema drift
+
+The client's schema is the application's, and it lags behind the remote one whenever the server deploys first. Supapower does not treat that as an error:
+
+- The download asks Supabase for the columns it knows by name, so a column it has never heard of is never sent.
+- A realtime change that carries one has it trimmed off before the row is written, and the column is reported once per session through [`onError`](#everything-else) as `column_ignored`. The rest of the row still lands.
+- An old client never overwrites what it dropped. `upsert` only sets the columns it sends, so a row updated locally keeps the newer column's value upstream.
+
+The value is therefore not lost, only not local yet. Once the application migration adds the column, the stored watermark no longer covers the columns being asked for, and that table is downloaded whole again to fill it in. The same happens if `cursor` is pointed at a different column - a watermark read out of one column says nothing about another.
 
 ##### `SupapowerSync` - The sync handle
 
@@ -277,7 +287,7 @@ Two things to know about it:
 - **The download reaches a minute further back than the last value it saw.** A write stamps its timestamp with the transaction's start time but only becomes visible when it commits, so a slow transaction can land a row behind a watermark that has already moved past it. The margin covers transactions up to a minute; anything slower is missed until the table is downloaded whole again.
 - **Hard `DELETE`s cannot be picked up this way.** The row is simply gone, so nothing comes back to say so. Use soft deletes, and read the schema recommendations below.
 
-The watermark is per table and is forgotten whenever the table is truncated, so a user change always starts from a whole download.
+The watermark is per table and records what it is worth: the value, the column it was read from, and the columns the download asked for. Change either and it no longer applies, and the table is pulled whole again - see [schema drift](#schema-drift). It is also forgotten whenever the table is truncated, so a user change always starts from a whole download.
 
 ###### Table `access` configuration
 
@@ -423,6 +433,7 @@ const sync = await pg.supapower.sync({
 | `upload_failed`     | Something in the outgoing pipeline failed and will be retried    |
 | `download_failed`   | Reading from Supabase failed                                     |
 | `apply_failed`      | A remote change could not be written into the local database     |
+| `column_ignored`    | A remote row carried a column this client's schema does not have |
 | `connection_failed` | The realtime channel could not be reached or stay joined         |
 | `delete_ignored`    | Supabase accepted a `DELETE` that matched no row                 |
 | `schema_mismatch`   | A queued change names a table that is not configured for syncing |
@@ -478,6 +489,9 @@ Recommendations are for either the client (<kbd>C</kbd>) or the server (<kbd>S</
 
 - <kbd>C</kbd> make all columns nullable, except the primary key
   - if you're really sure some other columns will never ever be missing in the future (like `created_at`) you can keep them non-nullable as well
+- <kbd>S</kbd> give every column you add later a default, or make it nullable
+  - an older client creating a row only sends the columns it knows about, so a new `NOT NULL` column without a default fails its insert with `23502`
+  - `23502` counts as [unrecoverable](#error-handling), so the change is discarded rather than retried: every client still on the previous version silently stops being able to create rows
 - <kbd>C</kbd> remove all foreign key constraints
   - keep the columns, but remove the constraints as we don't know in which order rows will be synced
 - <kbd>C</kbd><kbd>S</kbd> prefer soft deletes over `DELETE` queries, i.e. use a `deleted_at` column or similar and filter all queries with it

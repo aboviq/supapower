@@ -41,6 +41,8 @@ export interface FakeRealtimeChannel {
 export interface FakeSupabase {
   /** Every write issued, as `"<operation>:<table>"`, in order. */
   readonly calls: string[];
+  /** Every `select` issued, as `"<table>:<columns>"`, in order. */
+  readonly requestedColumns: string[];
   /** Every channel opened, in order, whether or not it is still open. */
   readonly channels: FakeRealtimeChannel[];
   /** The channel that is currently open, if any. */
@@ -50,7 +52,7 @@ export interface FakeSupabase {
     delete(options?: { count?: string }): {
       eq(): Promise<{ error: ResponseError | null; count: number | null }>;
     };
-    select(): FakeSelect;
+    select(columns?: string): FakeSelect;
   };
   channel(name: string): FakeRealtimeChannel;
   removeChannel(channel: FakeRealtimeChannel): Promise<'ok'>;
@@ -69,6 +71,8 @@ interface SelectResult {
 /** A thenable query builder, the shape PostgREST's own builder has. */
 export interface FakeSelect extends PromiseLike<SelectResult> {
   gte(column: string, value: string): FakeSelect;
+  /** Type-level on the real builder; here it just keeps the chain going. */
+  returns<_T>(): FakeSelect;
 }
 
 type AuthCallback = (event: string, session: { user: { id: string } } | null) => void;
@@ -113,6 +117,8 @@ function createSelect(
   rows: Array<Record<string, unknown>>,
   downloadError: (table: string) => ResponseError | null,
   calls: string[],
+  requested: string,
+  requestedColumns: string[],
 ): FakeSelect {
   let filter: string | undefined;
   let from: string | undefined;
@@ -124,13 +130,19 @@ function createSelect(
 
       return select;
     },
+    returns() {
+      return select;
+    },
     // PostgREST's query builder is itself thenable, which is what this stands in for.
     // oxlint-disable-next-line unicorn/no-thenable
     then(onResolved, onRejected) {
       const column = filter;
       const lowest = from;
 
-      calls.push(column === undefined ? `select:${table}` : `select:${table}:gte(${column})`);
+      const filtered = column === undefined ? '' : `:gte(${column})`;
+
+      calls.push(`select:${table}${filtered}`);
+      requestedColumns.push(`${table}:${requested}`);
 
       const error = downloadError(table);
 
@@ -200,6 +212,7 @@ export function createFakeSupabase({
   auth = true,
 }: FakeSupabaseOptions = {}): FakeSupabase {
   const calls: string[] = [];
+  const requestedColumns: string[] = [];
   const channels: FakeRealtimeChannel[] = [];
   const listeners = new Set<AuthCallback>();
   let currentUser = user;
@@ -243,6 +256,7 @@ export function createFakeSupabase({
 
   const supabase: FakeSupabase = {
     calls,
+    requestedColumns,
     channels,
     get openChannel() {
       return channels.findLast((channel) => !channel.removed);
@@ -250,7 +264,8 @@ export function createFakeSupabase({
     from: (table: string) => ({
       upsert: () => record(`upsert:${table}`, null),
       delete: () => ({ eq: () => record(`delete:${table}`, deletedRows(table)) }),
-      select: () => createSelect(table, rows[table] ?? [], downloadError, calls),
+      select: (requested = '*') =>
+        createSelect(table, rows[table] ?? [], downloadError, calls, requested, requestedColumns),
     }),
     channel(name) {
       const created = createChannel(name);

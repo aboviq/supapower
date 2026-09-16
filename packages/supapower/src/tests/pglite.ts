@@ -39,11 +39,12 @@ export interface FakePGliteOptions {
   /** Rows to seed the outgoing queue with. */
   changes?: ChangeRow[];
   /**
-   * Which columns each table has, for the primary key check `trackTables` runs.
+   * The columns each table has locally.
    *
-   * Left out, every column exists.
+   * A table left out has just `"id"`, which is what the primary key check
+   * needs and what most fixtures use.
    */
-  columns?: Record<string, string[]>;
+  columns?: Record<string, readonly string[]>;
 }
 
 export interface FakeWorkerPGliteOptions extends FakePGliteOptions {
@@ -107,11 +108,16 @@ function createBase({ changes = [], columns }: FakePGliteOptions): FakePGlite {
       }
     }
 
-    if (text.startsWith('SELECT 1 AS found FROM information_schema.columns')) {
-      const known = columns?.[String(values[0])];
-      const exists = !known || known.includes(String(values[1]));
+    if (text.startsWith('SELECT table_name, column_name FROM information_schema.columns')) {
+      const wanted = (values[0] as string[]) ?? [];
 
-      return Promise.resolve({ rows: exists ? [{ found: 1 }] : [] });
+      return Promise.resolve({
+        rows: wanted.flatMap((table) =>
+          (columns?.[table] ?? ['id'])
+            .toSorted()
+            .map((column) => ({ table_name: table, column_name: column })),
+        ),
+      });
     }
 
     if (text.startsWith('SELECT value FROM supapower.metadata')) {

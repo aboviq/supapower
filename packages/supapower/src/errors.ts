@@ -9,6 +9,8 @@ import type { PostgrestError } from '@supabase/supabase-js';
 export type SupapowerErrorCode =
   /** A remote change could not be written into the local database. */
   | 'apply_failed'
+  /** A remote row carried a column this client's schema does not have. */
+  | 'column_ignored'
   /** A realtime channel could not be reached or stay joined. */
   | 'connection_failed'
   /** Supabase accepted a `DELETE` that matched no row. */

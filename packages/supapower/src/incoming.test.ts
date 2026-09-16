@@ -1,12 +1,16 @@
 import { describe, expect, test } from 'bun:test';
 
 import type { SupapowerError } from './errors.js';
-import { resolveTables, runIncomingSync } from './sync.js';
+import { runIncomingSync } from './sync.js';
 import { settle, waitFor } from './tests/async.js';
 import { asPGlite, createFakePGlite } from './tests/pglite.js';
 import { asSupabaseClient, createFakeSupabase } from './tests/supabase.js';
+import { resolveTablesWith } from './tests/tables.js';
 
-const tables = resolveTables(['todos', { table: 'tags', primaryKey: 'tag_id' }]);
+const tables = resolveTablesWith(['todos', { table: 'tags', primaryKey: 'tag_id' }], {
+  todos: ['id', 'title'],
+  tags: ['tag_id', 'name'],
+});
 
 const insert = (table: string, row: Record<string, unknown>) => ({
   eventType: 'INSERT' as const,
@@ -175,6 +179,39 @@ describe('runIncomingSync', () => {
     expect(errors[0]?.code).toBe('connection_failed');
     // realtime-js rejoins on its own; tearing it down here would fight that.
     expect(channel?.removed).toBe(false);
+
+    controller.abort();
+    await running;
+  });
+});
+
+describe('runIncomingSync - schema drift', () => {
+  test('trims an unknown column off a remote change and reports it once', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase();
+    const controller = new AbortController();
+    const errors: SupapowerError[] = [];
+
+    const running = runIncomingSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: controller.signal,
+      onError: (error) => errors.push(error),
+    });
+
+    const drifted = { id: 1, title: 'one', added_later: 'boom' };
+
+    supabase.openChannel?.emit(insert('todos', drifted));
+    supabase.openChannel?.emit(insert('todos', { ...drifted, id: 2 }));
+
+    expect(await waitFor(() => errors.length > 0)).toBe(true);
+    await settle();
+
+    // Drift affects every row, so one notice is the useful part.
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.code).toBe('column_ignored');
+    expect(errors[0]?.message).toContain('"added_later"');
 
     controller.abort();
     await running;

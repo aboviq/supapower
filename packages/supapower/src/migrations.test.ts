@@ -39,7 +39,7 @@ const queue = async () => {
 
 describe('trackTables', () => {
   test('queues inserts, updates and deletes for a table keyed on "id"', async () => {
-    await trackTables(pg, [{ table: 'todos', primaryKey: 'id' }]);
+    await trackTables(pg, [{ table: 'todos', primaryKey: 'id', columns: ['id', 'title'] }]);
 
     await pg.exec(`INSERT INTO todos (title) VALUES ('one'), ('two');`);
     await pg.exec(`UPDATE todos SET title = title || '!';`);
@@ -58,7 +58,7 @@ describe('trackTables', () => {
   });
 
   test('queues updates for a table keyed on something other than "id"', async () => {
-    await trackTables(pg, [{ table: 'tags', primaryKey: 'tag_id' }]);
+    await trackTables(pg, [{ table: 'tags', primaryKey: 'tag_id', columns: ['name', 'tag_id'] }]);
 
     await pg.exec(`INSERT INTO tags (name) VALUES ('one'), ('two'), ('three');`);
     await pg.exec(`UPDATE tags SET name = name || '!';`);
@@ -78,9 +78,9 @@ describe('trackTables', () => {
   test('refuses a primary key the table does not have', async () => {
     // Silently recording nothing would be far worse than not starting: the
     // jsonb pairing would yield NULL on both sides and drop every update.
-    const thrown = await trackTables(pg, [{ table: 'tags', primaryKey: 'id' }]).catch(
-      (error: unknown) => error,
-    );
+    const thrown = await trackTables(pg, [
+      { table: 'tags', primaryKey: 'id', columns: ['name', 'tag_id'] },
+    ]).catch((error: unknown) => error);
 
     expect(isSupapowerError(thrown)).toBe(true);
     expect(isSupapowerError(thrown) && thrown.code).toBe('schema_mismatch');
@@ -88,7 +88,7 @@ describe('trackTables', () => {
   });
 
   test('does not record a change made while applying an incoming one', async () => {
-    await trackTables(pg, [{ table: 'todos', primaryKey: 'id' }]);
+    await trackTables(pg, [{ table: 'todos', primaryKey: 'id', columns: ['id', 'title'] }]);
 
     await pg.transaction(async (tx) => {
       await tx.exec(`SELECT set_config('supapower.applying', 'true', true)`);
@@ -99,9 +99,9 @@ describe('trackTables', () => {
   });
 
   test('is idempotent, as every tab runs it', async () => {
-    await trackTables(pg, [{ table: 'todos', primaryKey: 'id' }]);
+    await trackTables(pg, [{ table: 'todos', primaryKey: 'id', columns: ['id', 'title'] }]);
     await runMigrations(pg);
-    await trackTables(pg, [{ table: 'todos', primaryKey: 'id' }]);
+    await trackTables(pg, [{ table: 'todos', primaryKey: 'id', columns: ['id', 'title'] }]);
 
     await pg.exec(`INSERT INTO todos (title) VALUES ('once');`);
 

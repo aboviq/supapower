@@ -1,11 +1,15 @@
 import { describe, expect, test } from 'bun:test';
 
-import { reconcileUser, resolveTables, runInitialSync } from './sync.js';
+import { reconcileUser, runInitialSync } from './sync.js';
 import { createChange } from './tests/changes.js';
 import { asPGlite, createFakePGlite } from './tests/pglite.js';
 import { asSupabaseClient, createFakeSupabase } from './tests/supabase.js';
+import { resolveTablesWith } from './tests/tables.js';
 
-const tables = resolveTables(['todos', { table: 'plans', access: 'anon' }]);
+const tables = resolveTablesWith(['todos', { table: 'plans', access: 'anon' }], {
+  todos: ['id', 'title'],
+  plans: ['id'],
+});
 
 const live = () => new AbortController().signal;
 
@@ -169,10 +173,13 @@ describe('reconcileUser', () => {
 });
 
 describe('runInitialSync - incremental with a cursor', () => {
-  const incremental = resolveTables([
-    { table: 'todos', cursor: 'updated_at' },
-    { table: 'plans', access: 'anon' },
-  ]);
+  const incremental = resolveTablesWith(
+    [
+      { table: 'todos', cursor: 'updated_at' },
+      { table: 'plans', access: 'anon' },
+    ],
+    { todos: ['id', 'updated_at'], plans: ['id'] },
+  );
 
   const rows = {
     todos: [
@@ -193,7 +200,13 @@ describe('runInitialSync - incremental with a cursor', () => {
     });
 
     expect(supabase.calls).toEqual(['select:todos', 'select:plans']);
-    expect(pg.metadata.get('SyncedCursorAt')).toEqual({ todos: '2026-01-01T12:00:00.000Z' });
+    expect(pg.metadata.get('SyncedCursorAt')).toEqual({
+      todos: {
+        at: '2026-01-01T12:00:00.000Z',
+        cursor: 'updated_at',
+        columns: ['id', 'updated_at'],
+      },
+    });
   });
 
   test('asks only for what is new the next time', async () => {
@@ -271,7 +284,9 @@ describe('runInitialSync - incremental with a cursor', () => {
       signal: live(),
     });
 
-    expect(pg.metadata.get('SyncedCursorAt')).toEqual({ todos: '2026-01-01T12:00:00.000Z' });
+    expect(pg.metadata.get('SyncedCursorAt')).toMatchObject({
+      todos: { at: '2026-01-01T12:00:00.000Z' },
+    });
   });
 
   test('falls back to a whole table when the cursor is not a timestamp', async () => {
@@ -311,5 +326,105 @@ describe('runInitialSync - incremental with a cursor', () => {
     await reconcileUser(asPGlite(pg), incremental, 'user-a');
 
     expect(pg.metadata.get('SyncedCursorAt')).toEqual({});
+  });
+});
+
+describe('runInitialSync - schema drift', () => {
+  const drifted = resolveTablesWith([{ table: 'todos', cursor: 'updated_at' }], {
+    todos: ['id', 'updated_at'],
+  });
+
+  test('asks Supabase only for the columns this client has', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase();
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables: drifted,
+      signal: live(),
+    });
+
+    // A column this client has never heard of cannot arrive if it is never
+    // asked for.
+    expect(supabase.requestedColumns).toEqual(['todos:id,updated_at']);
+  });
+
+  test('pulls the whole table again once a column has been added locally', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase({
+      rows: { todos: [{ id: 1, updated_at: '2026-01-01T12:00:00.000Z' }] },
+    });
+
+    const run = (configs: typeof drifted) =>
+      runInitialSync({
+        pg: asPGlite(pg),
+        supabase: asSupabaseClient(supabase),
+        tables: configs,
+        signal: live(),
+      });
+
+    await run(drifted);
+
+    // As after an application migration: the column the server already had is
+    // now here, and no row has been downloaded with it.
+    await run(
+      resolveTablesWith([{ table: 'todos', cursor: 'updated_at' }], {
+        todos: ['id', 'title', 'updated_at'],
+      }),
+    );
+
+    expect(supabase.calls).toEqual(['select:todos', 'select:todos']);
+    expect(supabase.requestedColumns).toEqual(['todos:id,updated_at', 'todos:id,title,updated_at']);
+  });
+
+  test('keeps using the watermark when a column was only removed', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase({
+      rows: { todos: [{ id: 1, updated_at: '2026-01-01T12:00:00.000Z' }] },
+    });
+
+    const run = (configs: typeof drifted) =>
+      runInitialSync({
+        pg: asPGlite(pg),
+        supabase: asSupabaseClient(supabase),
+        tables: configs,
+        signal: live(),
+      });
+
+    await run(
+      resolveTablesWith([{ table: 'todos', cursor: 'updated_at' }], {
+        todos: ['id', 'title', 'updated_at'],
+      }),
+    );
+    await run(drifted);
+
+    // Nothing was lost upstream by dropping a column locally, so there is
+    // nothing to fetch again.
+    expect(supabase.calls).toEqual(['select:todos', 'select:todos:gte(updated_at)']);
+  });
+
+  test('pulls the whole table again when the cursor column changes', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase({
+      rows: { todos: [{ id: 1, updated_at: '2026-01-01T12:00:00.000Z', edited_at: 'x' }] },
+    });
+
+    const run = (cursor: string) =>
+      runInitialSync({
+        pg: asPGlite(pg),
+        supabase: asSupabaseClient(supabase),
+        tables: resolveTablesWith([{ table: 'todos', cursor }], {
+          todos: ['edited_at', 'id', 'updated_at'],
+        }),
+        signal: live(),
+      });
+
+    await run('updated_at');
+    await run('edited_at');
+
+    // The stored value came out of a different column; comparing the new one
+    // against it would quietly fetch the wrong set.
+    expect(supabase.calls).toEqual(['select:todos', 'select:todos']);
   });
 });

@@ -2,11 +2,12 @@ import { describe, expect, test } from 'bun:test';
 
 import type { UnrecoverableUploadError } from './changes.js';
 import { isUnrecoverableUploadError, type SupapowerError } from './errors.js';
-import { resolveTables, runOutgoingSync } from './sync.js';
+import { runOutgoingSync } from './sync.js';
 import { waitFor } from './tests/async.js';
 import { createChange } from './tests/changes.js';
 import { asPGlite, createFakePGlite } from './tests/pglite.js';
 import { asSupabaseClient, createFakeSupabase } from './tests/supabase.js';
+import { resolveTablesWith } from './tests/tables.js';
 
 const remove = (txId: string, id: number) =>
   createChange(txId, id, {
@@ -16,7 +17,7 @@ const remove = (txId: string, id: number) =>
   });
 
 describe('runOutgoingSync', () => {
-  const tables = resolveTables(['todos']);
+  const tables = resolveTablesWith(['todos'], { todos: ['id', 'title'] });
 
   test('pushes a batch and clears it from the queue', async () => {
     const pg = createFakePGlite({ changes: [createChange('100', 1), createChange('100', 2)] });
@@ -146,7 +147,7 @@ describe('runOutgoingSync', () => {
 });
 
 describe('runOutgoingSync - a DELETE that matched nothing', () => {
-  const tables = resolveTables(['todos']);
+  const tables = resolveTablesWith(['todos'], { todos: ['id', 'title'] });
 
   test('reports it and keeps the queue moving', async () => {
     const pg = createFakePGlite({ changes: [remove('100', 1)] });

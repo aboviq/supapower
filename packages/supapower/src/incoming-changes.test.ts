@@ -63,8 +63,15 @@ const remove = (table: string, old: Row): RealtimePostgresDeletePayload<Row> => 
   errors: [],
 });
 
+/** The local schema each table is given in `beforeEach`. */
+const LOCAL: Record<string, string[]> = {
+  todos: ['done', 'id', 'title'],
+  tags: ['name', 'tag_id'],
+  'odd names': ['group', 'select'],
+};
+
 const apply = (payload: RealtimePostgresChangesPayload<Row>, primaryKey = 'id') =>
-  handleIncomingChange(pg, payload, primaryKey);
+  handleIncomingChange(pg, payload, { primaryKey, columns: LOCAL[payload.table] ?? [] });
 
 const rowsOf = async <T>(query: string) => (await pg.query<T>(query)).rows;
 
@@ -137,7 +144,7 @@ describe('handleIncomingChange', () => {
   });
 
   test('does not queue what it applied as an outgoing change', async () => {
-    await trackTables(pg, [{ table: 'todos', primaryKey: 'id' }]);
+    await trackTables(pg, [{ table: 'todos', primaryKey: 'id', columns: ['done', 'id', 'title'] }]);
 
     await apply(insert('todos', { id: ONE, title: 'from the server', done: false }));
     await apply(update('todos', { id: ONE, title: 'edited remotely', done: true }, { id: ONE }));
@@ -148,7 +155,7 @@ describe('handleIncomingChange', () => {
   });
 
   test('leaves a local write alone, so tracking still works either side of it', async () => {
-    await trackTables(pg, [{ table: 'todos', primaryKey: 'id' }]);
+    await trackTables(pg, [{ table: 'todos', primaryKey: 'id', columns: ['done', 'id', 'title'] }]);
 
     await apply(insert('todos', { id: ONE, title: 'from the server', done: false }));
     await pg.exec(`INSERT INTO todos VALUES ('${TWO}', 'mine', false);`);
@@ -170,14 +177,21 @@ describe('handleIncomingChange', () => {
     expect(metadata?.value['todos']).toContain('2026-01-01T12:00:00');
   });
 
-  test('rolls the watermark back when the row could not be applied', async () => {
-    // A column the server has and this client does not, which is what schema
-    // drift looks like from here: the server deploys first.
-    const failing = apply(insert('todos', { id: ONE, title: 'one', added_later: 'boom' }));
+  test('leaves out a column this client does not have, and says which', async () => {
+    // What schema drift looks like from here: the server deploys first, so a
+    // remote row arrives carrying a column the local schema has never heard of.
+    const ignored = await apply(insert('todos', { id: ONE, title: 'one', added_later: 'boom' }));
 
-    await expect(failing).rejects.toThrow(
-      'column "added_later" of relation "todos" does not exist',
-    );
+    expect(ignored).toEqual(['added_later']);
+
+    // The rest of the row still lands, rather than 42703 failing the lot.
+    expect(await rowsOf('SELECT id, title FROM todos')).toEqual([{ id: ONE, title: 'one' }]);
+  });
+
+  test('rolls the watermark back when the row could not be applied', async () => {
+    const failing = apply(insert('todos', { id: ONE, title: 'one', done: 'not a boolean' }));
+
+    await expect(failing).rejects.toThrow();
 
     // The whole change is one transaction, so a watermark claiming otherwise
     // cannot survive the failure.
