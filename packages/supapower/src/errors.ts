@@ -15,6 +15,8 @@ export type SupapowerErrorCode =
   | 'connection_failed'
   /** Supabase accepted a `DELETE` that matched no row. */
   | 'delete_ignored'
+  /** Supabase accepted an `UPDATE` that matched no row. */
+  | 'update_ignored'
   /** Reading from Supabase failed. */
   | 'download_failed'
   | 'not_initialized'

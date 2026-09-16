@@ -237,9 +237,9 @@ Locally the rule is blunter, and only briefly: **while a row has an unsynced loc
 What that leaves:
 
 - **Two clients editing the same column still resolve last write wins.** The granularity is the column, not the edit. Supapower is not a CRDT and will not merge two people's text.
-- **A delete beats a concurrent edit**, whatever columns it touched. There is nothing to merge into.
+- **A delete beats a concurrent edit**, whatever columns it touched. There is nothing to merge into, and an edit that arrives after it matches no row.
+- **An update that matches no row is dropped**, and reported as `update_ignored`. The row is gone upstream, or row-level security is hiding it; from here the two look identical. Your local copy keeps the edit, so use the callback to decide what should happen to it.
 - **Converging needs a way back.** The round trip relies on the realtime echo, or failing that on [`cursor`](#table-cursor-configuration) picking the row up at the next start because your own upload moved its `updated_at`. A table with neither stays stale locally until it is downloaded whole again.
-- **An update for a row that is not upstream repairs itself.** If the update matches nothing - the insert that should have created the row never landed - the whole row is sent instead, from the copy the queue still holds.
 
 ##### Schema drift
 
@@ -455,20 +455,20 @@ const sync = await pg.supapower.sync({
 | `column_ignored`    | A remote row carried a column this client's schema does not have |
 | `connection_failed` | The realtime channel could not be reached or stay joined         |
 | `delete_ignored`    | Supabase accepted a `DELETE` that matched no row                 |
+| `update_ignored`    | Supabase accepted an `UPDATE` that matched no row                |
 | `schema_mismatch`   | A queued change names a table that is not configured for syncing |
 
 `asSupapowerError(value, message, code)` from `supapower/errors` is the same wrapper, if you want to
 funnel your own failures into the same shape.
 
-That last one is worth knowing about. Row-level security refuses a delete by filtering the row out of
-the policy's `USING` clause, not by raising, so a denied `DELETE` comes back as a perfectly ordinary
-success that removed nothing. Supapower asks PostgREST to count what it removed and reports a
-definite zero as `delete_ignored`.
+The last two are worth knowing about. Row-level security refuses a write by filtering the row out of
+the policy's `USING` clause, not by raising, so a denied `UPDATE` or `DELETE` comes back as an
+ordinary success that changed nothing. Supapower counts the rows it touched and reports a definite
+zero.
 
-It is reported rather than thrown, because a batch re-sent after a crash legitimately deletes nothing
-the second time and failing there would wedge the queue on a change that can never succeed again.
-That also means the two cases are indistinguishable from the client: `delete_ignored` means _either_
-the row was already gone _or_ the delete was refused.
+Reported, not thrown: a batch re-sent after a crash also matches nothing the second time, and failing
+there would wedge the queue on a change that can never succeed. That makes the two cases
+indistinguishable from the client - the row is gone upstream, or you may not write it.
 
 ### Entry points
 

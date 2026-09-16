@@ -154,16 +154,14 @@ function uploadFailed(
 /**
  * Pushes one queued change upstream.
  *
- * An update sends only the columns it changed, which is what lets a row edited
- * in two places at once end up with both edits. Sending the whole row would
- * replace whatever somebody else changed in the meantime - see "Conflicts" in
- * the readme.
+ * An update sends only the columns it changed, so a row edited in two places at
+ * once keeps both edits. See "Conflicts" in the readme.
  *
- * Everything here is idempotent on purpose: a crash between the upload and
- * {@link SyncTransaction.commit} leaves the batch queued, so the next leader
- * sends it again.
+ * Everything here is idempotent: a crash between the upload and
+ * {@link SyncTransaction.commit} leaves the batch queued for the next leader.
  *
- * @returns Whether Supabase actually changed anything.
+ * @returns Whether Supabase actually changed anything. An update or delete that
+ *   matched no row did not, and the caller reports it.
  */
 async function pushChange(
   supabase: SupabaseClient,
@@ -172,16 +170,14 @@ async function pushChange(
 ): Promise<boolean> {
   const { table, primaryKey } = tableFor(change, tables);
 
-  const upsertWholeRow = async (row: Record<string, unknown>) => {
-    const { error } = await supabase.from(table).upsert(row, { onConflict: primaryKey });
+  if (change.operation === 'INSERT') {
+    const { error } = await supabase
+      .from(table)
+      .upsert(change.new_data, { onConflict: primaryKey });
 
     if (error) {
       throw uploadFailed(change.operation, table, error);
     }
-  };
-
-  if (change.operation === 'INSERT') {
-    await upsertWholeRow(change.new_data);
 
     return true;
   }
@@ -219,17 +215,7 @@ async function pushChange(
     throw uploadFailed(change.operation, table, error);
   }
 
-  if (count !== 0) {
-    return true;
-  }
-
-  // Nothing to update, so the insert that should have created the row never
-  // landed. The queue still holds the whole row, so send that instead - and if
-  // the row is in fact there but hidden by row-level security, the upsert says
-  // so out loud rather than leaving the two silently apart.
-  await upsertWholeRow(change.new_data);
-
-  return true;
+  return count !== 0;
 }
 
 /** Resolves on the next queued change, after `timeoutMs`, or once aborted. */
@@ -316,9 +302,9 @@ export interface OutgoingSyncOptions {
  * changes wait rather than being pushed with an anonymous token and discarded
  * as a row-level security denial.
  *
- * A DELETE that matches no row is reported through `onError` rather than
- * thrown. It cannot be told apart from a batch re-sent after a crash, so the
- * queue keeps moving and the application decides whether it was a divergence.
+ * An UPDATE or DELETE that matches no row is reported through `onError`, not
+ * thrown. It looks the same as a batch re-sent after a crash, so the queue keeps
+ * moving and the application decides whether it was a divergence.
  *
  * Failures are sorted into two kinds. Anything transient - offline, a 5xx, a
  * dropped connection - leaves the batch queued and is retried with an
@@ -353,13 +339,13 @@ export async function runOutgoingSync({
             const applied = await pushChange(supabase, tables, change);
 
             if (!applied) {
-              // Not thrown: a batch re-sent after a crash legitimately deletes
-              // nothing the second time, and failing here would wedge the queue
-              // on a change that can never succeed again.
+              // Not thrown: a batch re-sent after a crash also matches nothing
+              // the second time, and failing here would wedge the queue on a
+              // change that can never succeed again.
               onError?.(
                 new SupapowerError(
-                  `Supabase ignored a DELETE on "${change.table_name}": no row matched. It may already be gone, or row-level security may be hiding it from this user.`,
-                  { code: 'delete_ignored' },
+                  `Supabase ignored a ${change.operation} on "${change.table_name}": no row matched. The row may be gone, or row-level security may be hiding it from this user.`,
+                  { code: change.operation === 'DELETE' ? 'delete_ignored' : 'update_ignored' },
                 ),
               );
             }

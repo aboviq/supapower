@@ -291,19 +291,31 @@ describe('runOutgoingSync - what an update sends', () => {
     expect(supabase.calls).toEqual([]);
   });
 
-  test('falls back to the whole row when the update matched nothing', async () => {
+  test('reports an update that matched nothing, and keeps the queue moving', async () => {
     const pg = createFakePGlite({
       changes: [
         edit({ id: 1, title: 'one', done: false }, { id: 1, title: 'edited', done: false }),
       ],
     });
-    // The insert that should have created the row upstream never landed.
+    // Either the row is gone upstream, or row-level security is hiding it.
     const supabase = createFakeSupabase({ updatedRows: () => 0 });
+    const errors: SupapowerError[] = [];
+    const controller = new AbortController();
 
-    await drain(pg, supabase);
+    const running = runOutgoingSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: controller.signal,
+      onError: (error) => errors.push(error),
+    });
 
-    expect(supabase.calls).toEqual(['update:todos', 'upsert:todos']);
-    expect(supabase.payloads[1]).toEqual({ id: 1, title: 'edited', done: false });
+    expect(await waitFor(() => pg.queue.length === 0)).toBe(true);
+    controller.abort();
+    await running;
+
+    expect(supabase.calls).toEqual(['update:todos']);
+    expect(errors[0]?.code).toBe('update_ignored');
   });
 
   test('still sends the whole row for an insert', async () => {
