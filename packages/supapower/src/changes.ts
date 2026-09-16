@@ -53,7 +53,7 @@ export interface SyncTransaction {
    *
    * Call it once the batch is upstream - or, from
    * {@link UnrecoverableUploadError}, to drop changes Supabase will never
-   * accept.
+   * accept. Only the changes that were yielded are removed.
    *
    * Idempotent, and safe to call concurrently: every caller after the first
    * awaits the same delete. A rejected delete is cached too, but the sync loop
@@ -99,17 +99,24 @@ export interface UnrecoverableUploadError {
  * a local transaction reaches Supabase whole or not at all. The generator ends
  * when the queue is empty.
  *
+ * Only changes to `tables` are considered. Changes to any other table stay
+ * queued and untouched, which is what keeps a signed out client from pushing
+ * the previous session's work with an anonymous token.
+ *
  * Callers must hold leadership for as long as they iterate - see
  * `./leadership.ts` for why that cannot be a lock inside Postgres.
  */
 export async function* getNextSyncTransaction(
   pg: PGliteInterface,
+  tables: string[],
   signal: AbortSignal,
 ): AsyncGenerator<SyncTransaction, undefined, void> {
   while (!signal.aborted) {
     // Get the oldest unsynced change's transaction ID
     const oldest = await pg.sql<{ tx_id: string }>`
-      SELECT tx_id FROM supapower.changes ORDER BY id ASC LIMIT 1
+      SELECT tx_id FROM supapower.changes
+      WHERE table_name = ANY(${tables}::text[])
+      ORDER BY id ASC LIMIT 1
     `;
 
     if (signal.aborted) {
@@ -126,6 +133,7 @@ export async function* getNextSyncTransaction(
     const batch = await pg.sql<ChangeRow>`
       SELECT * FROM supapower.changes
       WHERE tx_id = ${row.tx_id}
+        AND table_name = ANY(${tables}::text[])
       ORDER BY id ASC
     `;
 
@@ -139,8 +147,14 @@ export async function* getNextSyncTransaction(
     // through `onUnrecoverableError`, which may well call it more than once.
     const commit = once(async () => {
       // A tx_id is closed by the time it reaches the queue, so no row can join
-      // this batch after it was read.
-      await pg.sql`DELETE FROM supapower.changes WHERE tx_id = ${row.tx_id}`;
+      // this batch after it was read. The table filter repeats here so that a
+      // transaction touching both reachable and unreachable tables only loses
+      // the half that was actually pushed.
+      await pg.sql`
+        DELETE FROM supapower.changes
+        WHERE tx_id = ${row.tx_id}
+          AND table_name = ANY(${tables}::text[])
+      `;
     });
 
     yield { batch: batch.rows, commit };

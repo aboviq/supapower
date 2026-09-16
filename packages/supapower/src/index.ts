@@ -1,6 +1,7 @@
 import type { PGliteInterface } from '@electric-sql/pglite';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
+import type { UnrecoverableUploadError } from './changes.js';
 import { createLeadership } from './leadership.js';
 import { runMigrations, trackTables } from './migrations.js';
 import {
@@ -48,33 +49,59 @@ function watchAuthIdentity(
   }
 }
 
-interface IncomingSupervisorOptions {
+interface SyncSupervisorOptions {
   pg: PGliteInterface;
   supabase: SupabaseClient;
   tables: Map<string, ResolvedTableConfig>;
   /** Aborted when leadership is lost or the sync is unsubscribed. */
   signal: AbortSignal;
+  onUnrecoverableError?: (context: UnrecoverableUploadError) => void | Promise<void>;
+}
+
+/** The tables that are reachable for a given identity. */
+function reachableTables(
+  tables: Map<string, ResolvedTableConfig>,
+  identity: AuthIdentity,
+): Map<string, ResolvedTableConfig> {
+  if (identity !== null) {
+    return tables;
+  }
+
+  return new Map([...tables].filter(([, config]) => config.access === 'anon'));
 }
 
 /**
- * Keeps an incoming subscription open for whichever tables the current user can
- * actually see.
+ * Runs both directions of the sync for whoever is signed in.
  *
- * Tables marked `anon` are subscribed to at all times; the ones left on the
- * default `authenticated` only while somebody is signed in. Because that set
- * changes when the user does, the subscription is torn down and rebuilt on
- * every identity change - a channel cannot have bindings added to it after it
- * has been subscribed.
+ * Nothing starts until the auth client reports an identity. supabase-js queues
+ * the first `onAuthStateChange` notification until its own initialization has
+ * settled, so that callback doubles as an "authentication is ready" signal -
+ * whether or not there turns out to be a session.
+ *
+ * Waiting matters most for the outgoing queue. Its HTTP requests already block
+ * on the same initialization, since supabase-js resolves the token per request,
+ * but a queue drained before the session is known is drained with whatever
+ * token happens to exist. If the refresh token expired while the tab was
+ * closed, that is the anon key, and every change to an `authenticated` table
+ * comes back as a row-level security denial - which the outgoing loop treats as
+ * unrecoverable and discards. Those changes stay queued instead.
+ *
+ * Both directions share one signal per identity, so signing out aborts an
+ * upload in flight rather than letting it finish as the wrong user.
  */
-function superviseIncomingSync({ pg, supabase, tables, signal }: IncomingSupervisorOptions): void {
-  const anonymous = new Map([...tables].filter(([, config]) => config.access === 'anon'));
-
+function superviseSync({
+  pg,
+  supabase,
+  tables,
+  signal,
+  onUnrecoverableError,
+}: SyncSupervisorOptions): void {
   let identity: AuthIdentity | undefined;
   let running: AbortController | undefined;
 
   const restart = (next: AuthIdentity) => {
     if (signal.aborted || next === identity) {
-      return; // same user as before, the open channel is still the right one
+      return; // same user as before, what is already running is still right
     }
 
     identity = next;
@@ -82,6 +109,7 @@ function superviseIncomingSync({ pg, supabase, tables, signal }: IncomingSupervi
     running = new AbortController();
 
     const session = running.signal;
+    const reachable = reachableTables(tables, next);
 
     void (async () => {
       // Clears out the previous user's rows before anything is downloaded for
@@ -93,12 +121,16 @@ function superviseIncomingSync({ pg, supabase, tables, signal }: IncomingSupervi
         return;
       }
 
-      await runIncomingSync({
+      // Resolves when the session ends; each loop handles its own failures.
+      void runOutgoingSync({
         pg,
         supabase,
-        tables: next === null ? anonymous : tables,
+        tables: reachable,
         signal: session,
+        ...(onUnrecoverableError ? { onUnrecoverableError } : {}),
       });
+
+      await runIncomingSync({ pg, supabase, tables: reachable, signal: session });
     })();
   };
 
@@ -185,17 +217,13 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
       stopLeadership = leadership.subscribe((leaderSignal) => {
         // Both directions run on the leader only: every tab shares one
         // database, so a second syncer would otherwise duplicate every write.
-
-        // Resolves when leadership is lost; the loop handles its own failures.
-        void runOutgoingSync({
+        superviseSync({
           pg,
           supabase,
           tables: configs,
           signal: leaderSignal,
           ...(onUnrecoverableError ? { onUnrecoverableError } : {}),
         });
-
-        superviseIncomingSync({ pg, supabase, tables: configs, signal: leaderSignal });
       });
 
       return handle;

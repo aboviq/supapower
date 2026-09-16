@@ -199,6 +199,11 @@ export interface OutgoingSyncOptions {
  * sent upstream but not yet committed is re-sent by the next leader, which is
  * why {@link pushChange} only issues idempotent statements.
  *
+ * Only changes to the tables it is given are drained; anything else stays
+ * queued. That is what a signed out client relies on - its previous session's
+ * changes wait rather than being pushed with an anonymous token and discarded
+ * as a row-level security denial.
+ *
  * Failures are sorted into two kinds. Anything transient - offline, a 5xx, a
  * dropped connection - leaves the batch queued and is retried with an
  * exponential backoff. Anything Supabase will reject the same way every time
@@ -212,11 +217,13 @@ export async function runOutgoingSync({
   onUnrecoverableError = discardUnrecoverable,
   onError,
 }: OutgoingSyncOptions): Promise<void> {
+  const reachable = [...tables.keys()];
+
   let attempt = 0;
 
   while (!signal.aborted) {
     try {
-      for await (const { batch, commit } of getNextSyncTransaction(pg, signal)) {
+      for await (const { batch, commit } of getNextSyncTransaction(pg, reachable, signal)) {
         let rejected: ChangeRow | undefined;
 
         try {

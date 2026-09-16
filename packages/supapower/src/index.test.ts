@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 
 import { createSupapower } from './index.js';
 import { settle, waitFor } from './tests/async.js';
+import { createChange } from './tests/changes.js';
 import {
   asPGlite,
   createFakePGlite,
@@ -349,6 +350,59 @@ describe('createSupapower().sync - initial download', () => {
 
     expect(pg.truncated).toEqual(truncatedBefore);
     expect(supabase.calls).toEqual(before);
+
+    sync.unsubscribe();
+  });
+});
+
+describe('createSupapower().sync - waiting for authentication', () => {
+  const tables = ['todos', { table: 'plans', access: 'anon' as const }];
+
+  const start = async (supabase: FakeSupabase, pg: FakePGlite) =>
+    createSupapower(asPGlite(pg)).sync({
+      supabase: asSupabaseClient(supabase),
+      tables,
+    });
+
+  test('touches nothing until the auth client has reported an identity', async () => {
+    const pg = createFakeWorkerPGlite({
+      isLeader: true,
+      changes: [createChange('100', 1, { table_name: 'todos' })],
+    });
+    const supabase = createFakeSupabase({ user: 'user-a' });
+
+    // As after a reload: the local data already belongs to this user, so
+    // nothing is truncated and the queued change survives.
+    pg.metadata.set('SyncedUser', 'user-a');
+
+    await start(supabase, pg);
+
+    // The first onAuthStateChange notification lands a microtask later, the way
+    // supabase-js flushes it once its own initialization has settled.
+    expect(supabase.calls).toEqual([]);
+
+    expect(await waitFor(() => supabase.calls.includes('upsert:todos'))).toBe(true);
+  });
+
+  test('holds back queued changes for tables the signed out user cannot reach', async () => {
+    const pg = createFakeWorkerPGlite({
+      isLeader: true,
+      changes: [
+        createChange('100', 1, { table_name: 'todos' }),
+        createChange('101', 2, { table_name: 'plans' }),
+      ],
+    });
+    const supabase = createFakeSupabase();
+
+    const sync = await start(supabase, pg);
+
+    expect(await waitFor(() => supabase.calls.includes('upsert:plans'))).toBe(true);
+    await settle();
+
+    // Pushing "todos" now would go out with the anon key, come back as a
+    // row-level security denial, and be discarded as unrecoverable.
+    expect(supabase.calls).not.toContain('upsert:todos');
+    expect(pg.queue.map((change) => change.table_name)).toEqual(['todos']);
 
     sync.unsubscribe();
   });

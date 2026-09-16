@@ -61,20 +61,36 @@ function createBase({ changes = [] }: FakePGliteOptions): FakePGlite {
 
     statements.push(text);
 
+    // `ANY(?::text[])` is the reachable-table filter the outgoing sync applies.
+    const reachable = (position: number) => {
+      const names = values[position];
+
+      return Array.isArray(names) ? new Set(names as string[]) : undefined;
+    };
+
     if (text.startsWith('SELECT tx_id')) {
-      const [oldest] = queue;
+      const names = reachable(0);
+      const oldest = queue.find((row) => !names || names.has(row.table_name));
 
       return Promise.resolve({ rows: oldest ? [{ tx_id: oldest.tx_id }] : [] });
     }
 
     if (text.startsWith('SELECT * FROM supapower.changes')) {
-      return Promise.resolve({ rows: queue.filter((row) => row.tx_id === values[0]) });
+      const names = reachable(1);
+
+      return Promise.resolve({
+        rows: queue.filter(
+          (row) => row.tx_id === values[0] && (!names || names.has(row.table_name)),
+        ),
+      });
     }
 
     if (text.startsWith('DELETE FROM supapower.changes')) {
+      const names = reachable(1);
+
       const matches = text.includes('table_name = ?')
         ? (row: ChangeRow) => row.table_name === values[0]
-        : (row: ChangeRow) => row.tx_id === values[0];
+        : (row: ChangeRow) => row.tx_id === values[0] && (!names || names.has(row.table_name));
 
       for (let index = queue.length - 1; index >= 0; index -= 1) {
         const row = queue[index];
