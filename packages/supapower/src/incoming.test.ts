@@ -76,8 +76,6 @@ describe('runIncomingSync', () => {
     // Without this the local write would be queued straight back as an
     // outgoing change and echo around forever.
     expect(ran(pg, "set_config('supapower.applying', 'true', true)")).toBe(true);
-    // Applying a change and moving the watermark are one transaction.
-    expect(ran(pg, 'INSERT INTO supapower.metadata')).toBe(true);
 
     controller.abort();
     await running;
@@ -212,6 +210,77 @@ describe('runIncomingSync - schema drift', () => {
     expect(errors).toHaveLength(1);
     expect(errors[0]?.code).toBe('column_ignored');
     expect(errors[0]?.message).toContain('"added_later"');
+
+    controller.abort();
+    await running;
+  });
+});
+
+describe('runIncomingSync - catching up after a dropped channel', () => {
+  const start = (supabase: ReturnType<typeof createFakeSupabase>, signal: AbortSignal) =>
+    runIncomingSync({
+      pg: asPGlite(createFakePGlite()),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal,
+    });
+
+  test('downloads again when the channel comes back', async () => {
+    const supabase = createFakeSupabase();
+    const controller = new AbortController();
+
+    const running = start(supabase, controller.signal);
+
+    expect(await waitFor(() => supabase.calls.includes('select:tags'))).toBe(true);
+
+    const downloads = supabase.calls.length;
+
+    // realtime-js rejoins on its own but replays nothing, so whatever changed
+    // in between has to be fetched.
+    supabase.openChannel?.report('CHANNEL_ERROR');
+    supabase.openChannel?.report('SUBSCRIBED');
+
+    expect(await waitFor(() => supabase.calls.length > downloads)).toBe(true);
+    expect(supabase.calls.slice(downloads)).toEqual(['select:todos', 'select:tags']);
+
+    controller.abort();
+    await running;
+  });
+
+  test('does not download twice on the first subscribe', async () => {
+    const supabase = createFakeSupabase();
+    const controller = new AbortController();
+
+    const running = start(supabase, controller.signal);
+
+    expect(await waitFor(() => supabase.calls.includes('select:tags'))).toBe(true);
+    await settle();
+
+    expect(supabase.calls).toEqual(['select:todos', 'select:tags']);
+
+    controller.abort();
+    await running;
+  });
+
+  test('downloads once per outage, not once per status report', async () => {
+    const supabase = createFakeSupabase();
+    const controller = new AbortController();
+
+    const running = start(supabase, controller.signal);
+
+    await waitFor(() => supabase.calls.includes('select:tags'));
+
+    const downloads = supabase.calls.length;
+
+    supabase.openChannel?.report('TIMED_OUT');
+    supabase.openChannel?.report('CHANNEL_ERROR');
+    supabase.openChannel?.report('SUBSCRIBED');
+    supabase.openChannel?.report('SUBSCRIBED');
+
+    expect(await waitFor(() => supabase.calls.length > downloads)).toBe(true);
+    await settle();
+
+    expect(supabase.calls).toHaveLength(downloads * 2);
 
     controller.abort();
     await running;

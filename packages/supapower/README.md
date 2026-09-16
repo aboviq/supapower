@@ -168,7 +168,7 @@ When the database is set up the sync is started. The outgoing queue is drained o
 
 A realtime channel subscription is also set up on the provided `supabase` client to track remote changes to the tracked tables, and an initial download brings the local tables up to date behind it. Incoming changes are applied in the order they were broadcast, with the change triggers suppressed so an incoming change is not queued straight back up as an outgoing one.
 
-The channel is subscribed to before the download starts, so a change made while the download is in flight queues up behind the snapshot instead of falling in the gap between the two.
+The channel is subscribed to before the download starts, so a change made while the download is in flight queues up behind the snapshot instead of falling in the gap between the two. The download runs again whenever the channel comes back after dropping: a rejoin replays nothing, so anything that changed during the outage has to be fetched rather than waited for.
 
 Call it in **every** tab. The schema has to exist wherever writes happen, and the tab in charge of draining the queue may change at any time - see [Multi-tab behavior](#multi-tab-behavior) below.
 

@@ -24,12 +24,10 @@ import {
 } from './errors.js';
 import {
   clearSyncedCursorAt,
-  clearSyncedIncomingAt,
   type CursorWatermark,
   getSyncedCursorAt,
   getSyncedUser,
   setSyncedCursorAt,
-  setSyncedIncomingAt,
   setSyncedUser,
 } from './metadata.js';
 import type { SupapowerTableConfig } from './types.js';
@@ -345,7 +343,7 @@ export async function runOutgoingSync({
  *
  * `supapower.applying` is set for the transaction so the change triggers skip
  * it: an incoming change must not be queued straight back up as an outgoing
- * one. The watermark moves in the same transaction as the row itself.
+ * one.
  *
  * @param pg The PGlite interface or transaction to execute the change within.
  * @param payload The payload describing the incoming change from Supabase.
@@ -406,8 +404,6 @@ export async function handleIncomingChange(
     await tx.sql`SELECT set_config('supapower.applying', 'true', true)`;
 
     await tx.query(query, parameters);
-
-    await setSyncedIncomingAt(tx, payload.table, new Date(payload.commit_timestamp));
   });
 
   return ignored;
@@ -449,10 +445,10 @@ export async function reconcileUser(
       await tx.sql`DELETE FROM supapower.changes WHERE table_name = ${table}`;
     }
 
-    const names = owned.map(({ table }) => table);
-
-    await clearSyncedIncomingAt(tx, names);
-    await clearSyncedCursorAt(tx, names);
+    await clearSyncedCursorAt(
+      tx,
+      owned.map(({ table }) => table),
+    );
 
     await setSyncedUser(tx, user);
   });
@@ -641,6 +637,11 @@ export interface IncomingSyncOptions {
  * `supapower.applying` set so the change triggers do not queue it right back up
  * as an outgoing change.
  *
+ * A download runs behind the subscription, and again whenever the channel comes
+ * back after dropping. A rejoin replays nothing, so without that second one
+ * every change made during the outage would be lost until something else forced
+ * a whole download.
+ *
  * Runs only on the tab that holds leadership. Every tab shares one database, so
  * a subscription per tab would apply each change as many times as there are
  * tabs open.
@@ -727,19 +728,35 @@ export async function runIncomingSync({
     );
   }
 
+  const download = () => enqueue(() => runInitialSync({ pg, supabase, tables, signal }));
+
+  // Whether the channel has dropped since the last download. realtime-js
+  // rejoins on its own but replays nothing, so anything that changed while it
+  // was away has to be fetched rather than waited for.
+  let missedChanges = false;
+
   const closed = new Promise<void>((resolve) => {
     signal.addEventListener('abort', () => resolve(), { once: true });
 
     subscription.subscribe((status, error) => {
-      if (
-        status === REALTIME_SUBSCRIBE_STATES.SUBSCRIBED
-        || status === REALTIME_SUBSCRIBE_STATES.CLOSED
-      ) {
-        return; // CLOSED is what unsubscribing looks like from in here
+      if (status === REALTIME_SUBSCRIBE_STATES.CLOSED) {
+        return; // what unsubscribing looks like from in here
       }
 
-      // CHANNEL_ERROR and TIMED_OUT are reported but not acted on: realtime-js
-      // rejoins on its own, and tearing the channel down here would fight it.
+      if (status === REALTIME_SUBSCRIBE_STATES.SUBSCRIBED) {
+        if (missedChanges) {
+          missedChanges = false;
+          download();
+        }
+
+        return;
+      }
+
+      // CHANNEL_ERROR and TIMED_OUT are reported but not acted on beyond this:
+      // realtime-js rejoins on its own, and tearing the channel down here would
+      // fight it. The catch-up happens when it comes back.
+      missedChanges = true;
+
       onError?.(
         asSupapowerError(
           error,
@@ -753,7 +770,7 @@ export async function runIncomingSync({
   // Subscribe first, download second: a change made while the snapshot is in
   // flight arrives on the open channel and queues up behind it, rather than
   // falling in the gap between the two.
-  enqueue(() => runInitialSync({ pg, supabase, tables, signal }));
+  download();
 
   try {
     await closed;

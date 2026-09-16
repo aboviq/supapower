@@ -55,20 +55,6 @@ describe('runInitialSync', () => {
     expect(pg.statements).toContain("SELECT set_config('supapower.applying', 'true', true)");
   });
 
-  test('leaves a watermark for each downloaded table', async () => {
-    const pg = createFakePGlite();
-    const supabase = createFakeSupabase({ rows: { todos: [{ id: 1 }], plans: [{ id: 9 }] } });
-
-    await runInitialSync({
-      pg: asPGlite(pg),
-      supabase: asSupabaseClient(supabase),
-      tables,
-      signal: live(),
-    });
-
-    expect(Object.keys(pg.metadata.get('SyncedIncomingAt') as object)).toEqual(['todos', 'plans']);
-  });
-
   test('reports a failed download rather than carrying on', async () => {
     const pg = createFakePGlite();
     const supabase = createFakeSupabase({
@@ -145,11 +131,15 @@ describe('reconcileUser', () => {
 
     await reconcileUser(asPGlite(pg), tables, 'user-a');
 
-    pg.metadata.set('SyncedIncomingAt', { todos: '2026-01-01T00:00:00.000Z', plans: 'x' });
+    pg.metadata.set('SyncedCursorAt', {
+      todos: { at: '2026-01-01T00:00:00.000Z', cursor: 'updated_at', columns: ['id'] },
+      plans: { at: 'x', cursor: 'updated_at', columns: ['id'] },
+    });
 
     await reconcileUser(asPGlite(pg), tables, null);
 
-    expect(pg.metadata.get('SyncedIncomingAt')).toEqual({ plans: 'x' });
+    // "plans" is anon, so it is neither emptied nor forgotten.
+    expect(Object.keys(pg.metadata.get('SyncedCursorAt') as object)).toEqual(['plans']);
   });
 
   test('treats a database that was never synced as nothing to clear', async () => {

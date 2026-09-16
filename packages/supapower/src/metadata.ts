@@ -1,54 +1,9 @@
 import type { PGliteInterface, Transaction } from '@electric-sql/pglite';
 
-import { executeInTransaction } from './utils.js';
-
 const keys = {
-  syncedIncomingAt: 'SyncedIncomingAt',
   syncedUser: 'SyncedUser',
   syncedCursorAt: 'SyncedCursorAt',
 } as const;
-
-export const setSyncedIncomingAt = async (
-  pg: PGliteInterface | Transaction,
-  table: string,
-  syncedIncomingAt: Date,
-): Promise<void> => {
-  await executeInTransaction(pg, async (tx) => {
-    await tx.sql`
-      INSERT INTO supapower.metadata (
-        key,
-        value
-      )
-      VALUES (
-        ${keys.syncedIncomingAt},
-        ${JSON.stringify({ [table]: syncedIncomingAt.toISOString() })}
-      )
-      ON CONFLICT (key) DO UPDATE SET
-        value = metadata.value || EXCLUDED.value;
-    `;
-  });
-};
-
-/**
- * Forgets the watermarks for tables whose contents were dropped.
- *
- * A watermark left behind after a truncate claims the table is up to date with
- * a remote change it no longer holds.
- */
-export const clearSyncedIncomingAt = async (
-  pg: PGliteInterface | Transaction,
-  tables: string[],
-): Promise<void> => {
-  if (tables.length === 0) {
-    return;
-  }
-
-  await pg.sql`
-    UPDATE supapower.metadata
-    SET value = value - ${tables}::text[]
-    WHERE key = ${keys.syncedIncomingAt}
-  `;
-};
 
 /**
  * The user the local data was last synced for, or `null` when it was synced
@@ -84,6 +39,13 @@ export const setSyncedUser = async (
   `;
 };
 
+/**
+ * How far a table has been downloaded, and what that is worth.
+ *
+ * A bare value would be underspecified. It only means anything next to the
+ * column it was read from and the columns the download asked for: change
+ * either and the same timestamp answers a different question.
+ */
 export interface CursorWatermark {
   /** The highest value seen in the cursor column. */
   at: string;
@@ -96,9 +58,8 @@ export interface CursorWatermark {
 /**
  * How far a table has been downloaded, or `null` if it never has.
  *
- * Separate from {@link setSyncedIncomingAt}: that one records when this client
- * last saw a change, while this is a value read straight out of the remote
- * table, and the two are only comparable to themselves.
+ * The value comes straight out of the remote table, so it is only ever
+ * comparable to itself - see {@link CursorWatermark}.
  */
 export const getSyncedCursorAt = async (
   pg: PGliteInterface | Transaction,

@@ -167,35 +167,11 @@ describe('handleIncomingChange', () => {
     expect(changes).toEqual([{ operation: 'INSERT' }]);
   });
 
-  test('moves the watermark in the same transaction as the row', async () => {
-    await apply(insert('todos', { id: ONE, title: 'one', done: false }));
-
-    const [metadata] = await rowsOf<{ value: Record<string, string> }>(
-      "SELECT value FROM supapower.metadata WHERE key = 'SyncedIncomingAt'",
-    );
-
-    expect(metadata?.value['todos']).toContain('2026-01-01T12:00:00');
-  });
-
-  test('leaves out a column this client does not have, and says which', async () => {
-    // What schema drift looks like from here: the server deploys first, so a
-    // remote row arrives carrying a column the local schema has never heard of.
-    const ignored = await apply(insert('todos', { id: ONE, title: 'one', added_later: 'boom' }));
-
-    expect(ignored).toEqual(['added_later']);
-
-    // The rest of the row still lands, rather than 42703 failing the lot.
-    expect(await rowsOf('SELECT id, title FROM todos')).toEqual([{ id: ONE, title: 'one' }]);
-  });
-
-  test('rolls the watermark back when the row could not be applied', async () => {
+  test('applies nothing at all when the row could not be written', async () => {
     const failing = apply(insert('todos', { id: ONE, title: 'one', done: 'not a boolean' }));
 
     await expect(failing).rejects.toThrow();
 
-    // The whole change is one transaction, so a watermark claiming otherwise
-    // cannot survive the failure.
-    expect(await rowsOf('SELECT key FROM supapower.metadata')).toEqual([]);
     expect(await rowsOf('SELECT id FROM todos')).toEqual([]);
   });
 });
