@@ -1,6 +1,10 @@
-# `supapower`
+<picture>
+  <source srcset="../../assets/supapower-dark.png" media="(prefers-color-scheme: dark)">
+  <source srcset="../../assets/supapower-light.png" media="(prefers-color-scheme: light)">
+  <img src="../../assets/supapower-light.png" alt="Supapower">
+</picture>
 
-![Supapower](../../assets/supapower.svg)
+# `supapower`
 
 The core for [Supapower](https://github.com/aboviq/supapower), a sync engine that keeps a
 local PGlite database in sync with Supabase inspired by PowerSync.
@@ -23,7 +27,7 @@ The Data API is also used for initially syncing data, and after the initial sync
 
 ## Installation
 
-Supapower needs both `@supabase/supabase-js` and `@electric-sql/pglite` as peer dependencies, so install all three with:
+Supapower needs both `@supabase/supabase-js` and `@electric-sql/pglite` as peer dependencies, so install them and `supapower` with:
 
 ```bash
 npm install supapower @electric-sql/pglite @supabase/supabase-js

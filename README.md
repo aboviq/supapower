@@ -1,6 +1,10 @@
-# Supapower
+<picture>
+  <source srcset="assets/supapower-dark.png" media="(prefers-color-scheme: dark)">
+  <source srcset="assets/supapower-light.png" media="(prefers-color-scheme: light)">
+  <img src="assets/supapower-light.png" alt="Supapower">
+</picture>
 
-![Supapower](./assets/supapower.svg)
+# Supapower
 
 Supapower is a sync engine that keeps a local [PGlite](https://pglite.dev/) database in sync with
 [Supabase](https://supabase.com/), so an application can read and write locally and stay usable
