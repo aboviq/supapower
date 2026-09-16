@@ -46,8 +46,10 @@ export interface FakeSupabase {
   /** The channel that is currently open, if any. */
   readonly openChannel: FakeRealtimeChannel | undefined;
   from(table: string): {
-    upsert(): Promise<{ error: ResponseError | null }>;
-    delete(): { eq(): Promise<{ error: ResponseError | null }> };
+    upsert(): Promise<{ error: ResponseError | null; count: number | null }>;
+    delete(options?: { count?: string }): {
+      eq(): Promise<{ error: ResponseError | null; count: number | null }>;
+    };
     select(): FakeSelect;
   };
   channel(name: string): FakeRealtimeChannel;
@@ -75,6 +77,13 @@ type AuthSubscription = { data: { subscription: { unsubscribe(): void } } };
 export interface FakeSupabaseOptions {
   /** How the n:th write is answered. Defaults to accepting everything. */
   respond?: Respond;
+  /**
+   * How many rows a `delete()` reports removing. Defaults to one.
+   *
+   * Zero is what row-level security refusing a delete looks like: the row is
+   * filtered out of the `USING` clause rather than raising.
+   */
+  deletedRows?: (table: string) => number | null;
   /** What `select()` returns per table. Defaults to an empty table. */
   rows?: Record<string, Array<Record<string, unknown>>>;
   /** Fails `select()` for the tables it answers for. */
@@ -184,6 +193,7 @@ function createChannel(name: string): FakeRealtimeChannel {
  */
 export function createFakeSupabase({
   respond = () => null,
+  deletedRows = () => 1,
   rows = {},
   downloadError = () => null,
   user = null,
@@ -194,10 +204,10 @@ export function createFakeSupabase({
   const listeners = new Set<AuthCallback>();
   let currentUser = user;
 
-  const record = (operation: string) => {
+  const record = (operation: string, count: number | null) => {
     calls.push(operation);
 
-    return Promise.resolve({ error: respond(calls.length - 1) });
+    return Promise.resolve({ error: respond(calls.length - 1), count });
   };
 
   const session = () => (currentUser === null ? null : { user: { id: currentUser } });
@@ -238,8 +248,8 @@ export function createFakeSupabase({
       return channels.findLast((channel) => !channel.removed);
     },
     from: (table: string) => ({
-      upsert: () => record(`upsert:${table}`),
-      delete: () => ({ eq: () => record(`delete:${table}`) }),
+      upsert: () => record(`upsert:${table}`, null),
+      delete: () => ({ eq: () => record(`delete:${table}`, deletedRows(table)) }),
       select: () => createSelect(table, rows[table] ?? [], downloadError, calls),
     }),
     channel(name) {

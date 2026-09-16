@@ -56,6 +56,7 @@ interface SyncSupervisorOptions {
   /** Aborted when leadership is lost or the sync is unsubscribed. */
   signal: AbortSignal;
   onUnrecoverableError?: (context: UnrecoverableUploadError) => void | Promise<void>;
+  onError?: (error: unknown) => void;
 }
 
 /** The tables that are reachable for a given identity. */
@@ -95,6 +96,7 @@ function superviseSync({
   tables,
   signal,
   onUnrecoverableError,
+  onError,
 }: SyncSupervisorOptions): void {
   let identity: AuthIdentity | undefined;
   let running: AbortController | undefined;
@@ -128,9 +130,16 @@ function superviseSync({
         tables: reachable,
         signal: session,
         ...(onUnrecoverableError ? { onUnrecoverableError } : {}),
+        ...(onError ? { onError } : {}),
       });
 
-      await runIncomingSync({ pg, supabase, tables: reachable, signal: session });
+      await runIncomingSync({
+        pg,
+        supabase,
+        tables: reachable,
+        signal: session,
+        ...(onError ? { onError } : {}),
+      });
     })();
   };
 
@@ -174,6 +183,7 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
       signal,
       scope = 'default',
       onUnrecoverableError,
+      onError,
     }: SupapowerSyncOptions): Promise<SupapowerSync> {
       const leadership = createLeadership(pg, scope);
       const configs = resolveTables(tables);
@@ -223,6 +233,7 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
           tables: configs,
           signal: leaderSignal,
           ...(onUnrecoverableError ? { onUnrecoverableError } : {}),
+          ...(onError ? { onError } : {}),
         });
       });
 

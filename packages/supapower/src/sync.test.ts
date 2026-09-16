@@ -1,12 +1,19 @@
 import { describe, expect, test } from 'bun:test';
 
 import type { UnrecoverableUploadError } from './changes.js';
-import { isUnrecoverableUploadError, SupapowerError } from './errors.js';
+import { isSupapowerError, isUnrecoverableUploadError, SupapowerError } from './errors.js';
 import { resolveTables, runOutgoingSync } from './sync.js';
 import { waitFor } from './tests/async.js';
 import { createChange } from './tests/changes.js';
 import { asPGlite, createFakePGlite } from './tests/pglite.js';
 import { asSupabaseClient, createFakeSupabase } from './tests/supabase.js';
+
+const remove = (txId: string, id: number) =>
+  createChange(txId, id, {
+    operation: 'DELETE',
+    new_data: null,
+    old_data: { id, title: 'gone' },
+  });
 
 describe('runOutgoingSync', () => {
   const tables = resolveTables(['todos']);
@@ -135,5 +142,75 @@ describe('runOutgoingSync', () => {
 
     expect(handled).toBe(1);
     expect(pg.queue).toHaveLength(1);
+  });
+});
+
+describe('runOutgoingSync - a DELETE that matched nothing', () => {
+  const tables = resolveTables(['todos']);
+
+  test('reports it and keeps the queue moving', async () => {
+    const pg = createFakePGlite({ changes: [remove('100', 1)] });
+    // What row-level security refusing a delete looks like: the row is filtered
+    // out of the USING clause rather than the request failing.
+    const supabase = createFakeSupabase({ deletedRows: () => 0 });
+    const controller = new AbortController();
+    const errors: unknown[] = [];
+
+    const running = runOutgoingSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: controller.signal,
+      onError: (error) => errors.push(error),
+    });
+
+    expect(await waitFor(() => pg.queue.length === 0)).toBe(true);
+    controller.abort();
+    await running;
+
+    expect(errors).toHaveLength(1);
+    expect(isSupapowerError(errors[0]) && errors[0].code).toBe('delete_ignored');
+  });
+
+  test('says nothing when a row was actually removed', async () => {
+    const pg = createFakePGlite({ changes: [remove('100', 1)] });
+    const supabase = createFakeSupabase();
+    const controller = new AbortController();
+    const errors: unknown[] = [];
+
+    const running = runOutgoingSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: controller.signal,
+      onError: (error) => errors.push(error),
+    });
+
+    expect(await waitFor(() => pg.queue.length === 0)).toBe(true);
+    controller.abort();
+    await running;
+
+    expect(errors).toEqual([]);
+  });
+
+  test('says nothing when the server reported no count at all', async () => {
+    const pg = createFakePGlite({ changes: [remove('100', 1)] });
+    const supabase = createFakeSupabase({ deletedRows: () => null });
+    const controller = new AbortController();
+    const errors: unknown[] = [];
+
+    const running = runOutgoingSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: controller.signal,
+      onError: (error) => errors.push(error),
+    });
+
+    expect(await waitFor(() => pg.queue.length === 0)).toBe(true);
+    controller.abort();
+    await running;
+
+    expect(errors).toEqual([]);
   });
 });

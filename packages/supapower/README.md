@@ -208,6 +208,12 @@ interface SupapowerSyncOptions {
    * @default Discards the batch.
    */
   onUnrecoverableError?: (context: UnrecoverableUploadError) => void | Promise<void>;
+  /**
+   * Called for anything that went wrong but did not stop the sync.
+   *
+   * Without it every one of those passes silently.
+   */
+  onError?: (error: unknown) => void;
 }
 ```
 
@@ -382,6 +388,35 @@ backoff - use that to park a batch rather than lose it, but expect the callback 
 Uploads are idempotent by design - `upsert` on the primary key, `delete` by primary key - because a
 crash between the upload and the queue delete leaves the batch queued for the next leader to send
 again.
+
+#### Everything else
+
+Anything that goes wrong without stopping the sync goes to `onError`, and without it passes silently:
+an upload or download that failed and will be retried, a realtime channel reporting trouble, a change
+that could not be applied locally, and a `DELETE` that matched no row upstream. Each error carries a
+`SupapowerErrorCode` you can switch on.
+
+```ts
+const sync = await pg.supapower.sync({
+  supabase,
+  tables: ['todos'],
+  onError: (error) => {
+    if (isSupapowerError(error) && error.code === 'delete_ignored') {
+      // Local and remote have diverged; the row is still upstream.
+    }
+  },
+});
+```
+
+That last one is worth knowing about. Row-level security refuses a delete by filtering the row out of
+the policy's `USING` clause, not by raising, so a denied `DELETE` comes back as a perfectly ordinary
+success that removed nothing. Supapower asks PostgREST to count what it removed and reports a
+definite zero as `delete_ignored`.
+
+It is reported rather than thrown, because a batch re-sent after a crash legitimately deletes nothing
+the second time and failing there would wedge the queue on a change that can never succeed again.
+That also means the two cases are indistinguishable from the client: `delete_ignored` means _either_
+the row was already gone _or_ the delete was refused.
 
 ### Entry points
 

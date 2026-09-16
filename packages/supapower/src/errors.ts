@@ -8,6 +8,7 @@ import type { PostgrestError } from '@supabase/supabase-js';
  */
 export type SupapowerErrorCode =
   | 'connection_failed'
+  | 'delete_ignored'
   | 'download_failed'
   | 'not_initialized'
   | 'schema_mismatch'

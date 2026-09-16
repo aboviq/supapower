@@ -115,6 +115,19 @@ export interface SupapowerSyncOptions {
    * @default Discards the batch.
    */
   onUnrecoverableError?: (context: UnrecoverableUploadError) => void | Promise<void>;
+  /**
+   * Called for anything that went wrong but did not stop the sync.
+   *
+   * A failed upload or download that will be retried, a realtime channel
+   * reporting trouble, a change that could not be applied locally, and a
+   * `DELETE` that matched no row upstream - which is how row-level security
+   * refuses a delete, since it filters the row out rather than raising.
+   *
+   * Purely for reporting: the sync carries on either way, and without this
+   * callback every one of those passes silently. Errors carry a
+   * {@link SupapowerErrorCode} you can switch on.
+   */
+  onError?: (error: unknown) => void;
 }
 
 export interface SupapowerSync {

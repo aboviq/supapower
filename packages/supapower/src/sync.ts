@@ -104,12 +104,18 @@ async function pushChange(
   supabase: SupabaseClient,
   tables: Map<string, ResolvedTableConfig>,
   change: ChangeRow,
-): Promise<void> {
+): Promise<boolean> {
   const { table, primaryKey } = tableFor(change, tables);
 
-  const { error } =
+  // A DELETE is asked to count what it removed. Row-level security filters a
+  // forbidden row out of the `USING` clause rather than raising, so without the
+  // count a denied delete is indistinguishable from a successful one.
+  const { error, count } =
     change.operation === 'DELETE'
-      ? await supabase.from(table).delete().eq(primaryKey, change.old_data[primaryKey])
+      ? await supabase
+          .from(table)
+          .delete({ count: 'exact' })
+          .eq(primaryKey, change.old_data[primaryKey])
       : await supabase.from(table).upsert(change.new_data, { onConflict: primaryKey });
 
   if (error) {
@@ -118,6 +124,10 @@ async function pushChange(
       { cause: error },
     );
   }
+
+  // `null` means the server did not report a count; only a definite zero is
+  // worth telling anybody about.
+  return change.operation !== 'DELETE' || count !== 0;
 }
 
 /** Resolves on the next queued change, after `timeoutMs`, or once aborted. */
@@ -204,6 +214,10 @@ export interface OutgoingSyncOptions {
  * changes wait rather than being pushed with an anonymous token and discarded
  * as a row-level security denial.
  *
+ * A DELETE that matches no row is reported through `onError` rather than
+ * thrown. It cannot be told apart from a batch re-sent after a crash, so the
+ * queue keeps moving and the application decides whether it was a divergence.
+ *
  * Failures are sorted into two kinds. Anything transient - offline, a 5xx, a
  * dropped connection - leaves the batch queued and is retried with an
  * exponential backoff. Anything Supabase will reject the same way every time
@@ -234,7 +248,19 @@ export async function runOutgoingSync({
 
             rejected = change;
 
-            await pushChange(supabase, tables, change);
+            const applied = await pushChange(supabase, tables, change);
+
+            if (!applied) {
+              // Not thrown: a batch re-sent after a crash legitimately deletes
+              // nothing the second time, and failing here would wedge the queue
+              // on a change that can never succeed again.
+              onError?.(
+                new SupapowerError(
+                  `Supabase ignored a DELETE on "${change.table_name}": no row matched. It may already be gone, or row-level security may be hiding it from this user.`,
+                  { code: 'delete_ignored' },
+                ),
+              );
+            }
           }
 
           if (signal.aborted) {
