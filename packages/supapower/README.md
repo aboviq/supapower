@@ -166,7 +166,9 @@ For each tracked table a statement trigger is attached for `INSERT`, `UPDATE` an
 
 When the database is set up the sync is started. The outgoing queue is drained one local transaction at a time using the provided `supabase` client, and the loop is woken by a `NOTIFY` from the change trigger rather than by polling.
 
-A realtime channel subscription is also set up on the provided `supabase` client to track remote changes to the tracked tables, and an initial download brings the local tables up to date behind it. Incoming changes are applied in the order they were broadcast, with the change triggers suppressed so an incoming change is not queued straight back up as an outgoing one.
+A realtime channel subscription is also set up on the provided `supabase` client to track remote changes to the tracked tables, and an initial download brings the local tables up to date behind it. Incoming changes are applied in the order they were broadcast, with the change triggers suppressed so an incoming change is not queued straight back up as an outgoing one. A row whose local change is still waiting in the outgoing queue is left as it is - see [Conflicts](#conflicts).
+
+Inserts and updates are applied the same way, as an upsert on the primary key. An update for a row this client never received the insert for therefore still lands, rather than matching nothing at all. Primary keys are assumed never to change.
 
 The channel is subscribed to before the download starts, so a change made while the download is in flight queues up behind the snapshot instead of falling in the gap between the two. The download runs again whenever the channel comes back after dropping: a rejoin replays nothing, so anything that changed during the outage has to be fetched rather than waited for.
 
@@ -223,6 +225,21 @@ The initial sync is performed in the specified order of the tables provided in t
 
 > [!NOTE]
 > The initial sync asks only for the columns this client's schema has, upserts whole rows on the primary key - which makes re-running it harmless - and never deletes. A row hard deleted remotely while this client was away only disappears locally on the next truncation. Configure [`cursor`](#table-cursor-configuration) to make it ask for only what changed; without it, every start pulls the whole table.
+
+##### Conflicts
+
+A row can be edited in two places at once: locally, while the change is still waiting in the outgoing queue, and remotely by somebody else. Supapower resolves that **per column**.
+
+An update sends only the columns it actually changed, worked out from the before and after images the change trigger recorded. So if you edit `title` offline while somebody else edits `done`, your upload sets `title` and leaves `done` as they left it. The merge happens in Postgres, and both edits survive.
+
+Locally the rule is blunter, and only briefly: **while a row has an unsynced local change, an incoming change for it is not applied.** That is a delay rather than a loss. Your own upload comes back over realtime carrying the whole merged row - `postgres_changes` always sends the full record - and by then the queue is empty, so it lands. The row converges on the version that has both edits.
+
+What that leaves:
+
+- **Two clients editing the same column still resolve last write wins.** The granularity is the column, not the edit. Supapower is not a CRDT and will not merge two people's text.
+- **A delete beats a concurrent edit**, whatever columns it touched. There is nothing to merge into.
+- **Converging needs a way back.** The round trip relies on the realtime echo, or failing that on [`cursor`](#table-cursor-configuration) picking the row up at the next start because your own upload moved its `updated_at`. A table with neither stays stale locally until it is downloaded whole again.
+- **An update for a row that is not upstream repairs itself.** If the update matches nothing - the insert that should have created the row never landed - the whole row is sent instead, from the copy the queue still holds.
 
 ##### Schema drift
 
@@ -396,9 +413,10 @@ backoff - use that to park a batch rather than lose it, but expect the callback 
 > upstream, so dropping the batch leaves that transaction half applied in Supabase with nothing
 > locally to say so. Treat `onUnrecoverableError` as the last chance to notice a divergence.
 
-Uploads are idempotent by design - `upsert` on the primary key, `delete` by primary key - because a
-crash between the upload and the queue delete leaves the batch queued for the next leader to send
-again.
+Uploads are idempotent by design - an insert upserts on the primary key, an update sets only the
+columns it changed, a delete goes by primary key - because a crash between the upload and the queue
+delete leaves the batch queued for the next leader to send again. See [Conflicts](#conflicts) for
+what an update does about a row somebody else touched in the meantime.
 
 #### Everything else
 

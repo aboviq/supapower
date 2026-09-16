@@ -4,6 +4,7 @@
 
 import type { PGliteInterface, Transaction } from '@electric-sql/pglite';
 import {
+  type PostgrestError,
   REALTIME_SUBSCRIBE_STATES,
   type RealtimePostgresChangesPayload,
   type RealtimePostgresInsertPayload,
@@ -14,6 +15,7 @@ import {
   getNextSyncTransaction,
   type ChangeRow,
   type UnrecoverableUploadError,
+  type UpdateChange,
 } from './changes.js';
 import { CHANGES_CHANNEL } from './constants.js';
 import {
@@ -123,6 +125,46 @@ function tableFor(
  * and {@link SyncTransaction.commit} leaves the batch queued, so the next
  * leader sends it again.
  */
+/**
+ * The columns an update actually changed.
+ *
+ * Both sides come from `to_jsonb(row)` and jsonb normalizes key order, so
+ * comparing the serialized values is enough - no deep equality needed. A column
+ * edited back to the value it started with drops out on its own.
+ */
+function changedColumns(change: UpdateChange): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(change.new_data).filter(
+      ([column, value]) => JSON.stringify(value) !== JSON.stringify(change.old_data[column]),
+    ),
+  );
+}
+
+function uploadFailed(
+  operation: string,
+  table: string,
+  error: PostgrestError,
+): SupapowerUploadError {
+  return new SupapowerUploadError(
+    `Could not push a ${operation} on "${table}" to Supabase: ${error.message}`,
+    { cause: error },
+  );
+}
+
+/**
+ * Pushes one queued change upstream.
+ *
+ * An update sends only the columns it changed, which is what lets a row edited
+ * in two places at once end up with both edits. Sending the whole row would
+ * replace whatever somebody else changed in the meantime - see "Conflicts" in
+ * the readme.
+ *
+ * Everything here is idempotent on purpose: a crash between the upload and
+ * {@link SyncTransaction.commit} leaves the batch queued, so the next leader
+ * sends it again.
+ *
+ * @returns Whether Supabase actually changed anything.
+ */
 async function pushChange(
   supabase: SupabaseClient,
   tables: Map<string, ResolvedTableConfig>,
@@ -130,27 +172,64 @@ async function pushChange(
 ): Promise<boolean> {
   const { table, primaryKey } = tableFor(change, tables);
 
-  // A DELETE is asked to count what it removed. Row-level security filters a
-  // forbidden row out of the `USING` clause rather than raising, so without the
-  // count a denied delete is indistinguishable from a successful one.
-  const { error, count } =
-    change.operation === 'DELETE'
-      ? await supabase
-          .from(table)
-          .delete({ count: 'exact' })
-          .eq(primaryKey, change.old_data[primaryKey])
-      : await supabase.from(table).upsert(change.new_data, { onConflict: primaryKey });
+  const upsertWholeRow = async (row: Record<string, unknown>) => {
+    const { error } = await supabase.from(table).upsert(row, { onConflict: primaryKey });
 
-  if (error) {
-    throw new SupapowerUploadError(
-      `Could not push a ${change.operation} on "${table}" to Supabase: ${error.message}`,
-      { cause: error },
-    );
+    if (error) {
+      throw uploadFailed(change.operation, table, error);
+    }
+  };
+
+  if (change.operation === 'INSERT') {
+    await upsertWholeRow(change.new_data);
+
+    return true;
   }
 
-  // `null` means the server did not report a count; only a definite zero is
-  // worth telling anybody about.
-  return change.operation !== 'DELETE' || count !== 0;
+  // A write is asked to count what it touched. Row-level security filters a
+  // forbidden row out of the `USING` clause rather than raising, so without the
+  // count a denied write is indistinguishable from a successful one.
+  if (change.operation === 'DELETE') {
+    const { error, count } = await supabase
+      .from(table)
+      .delete({ count: 'exact' })
+      .eq(primaryKey, change.old_data[primaryKey]);
+
+    if (error) {
+      throw uploadFailed(change.operation, table, error);
+    }
+
+    // `null` means the server did not report a count; only a definite zero is
+    // worth telling anybody about.
+    return count !== 0;
+  }
+
+  const changed = changedColumns(change);
+
+  if (Object.keys(changed).length === 0) {
+    return true; // an update that moved nothing, which upstream already agrees with
+  }
+
+  const { error, count } = await supabase
+    .from(table)
+    .update(changed, { count: 'exact' })
+    .eq(primaryKey, change.old_data[primaryKey]);
+
+  if (error) {
+    throw uploadFailed(change.operation, table, error);
+  }
+
+  if (count !== 0) {
+    return true;
+  }
+
+  // Nothing to update, so the insert that should have created the row never
+  // landed. The queue still holds the whole row, so send that instead - and if
+  // the row is in fact there but hidden by row-level security, the upsert says
+  // so out loud rather than leaving the two silently apart.
+  await upsertWholeRow(change.new_data);
+
+  return true;
 }
 
 /** Resolves on the next queued change, after `timeoutMs`, or once aborted. */
@@ -345,6 +424,10 @@ export async function runOutgoingSync({
  * it: an incoming change must not be queued straight back up as an outgoing
  * one.
  *
+ * A row with a local change still waiting in the outgoing queue is left alone.
+ * See "Conflicts" in the readme for why the local version wins, and what that
+ * costs.
+ *
  * @param pg The PGlite interface or transaction to execute the change within.
  * @param payload The payload describing the incoming change from Supabase.
  * @param primaryKey The primary key column of the table being changed.
@@ -358,47 +441,63 @@ export async function handleIncomingChange(
   const parameters: unknown[] = [];
   const ignored: string[] = [];
 
-  for (const [column, value] of Object.entries(payload.new)) {
-    // A column the server has and this client does not. Naming it in the
-    // statement would fail the whole change with 42703, so it is left out and
-    // handed back for the caller to report.
-    if (!local.includes(column)) {
-      ignored.push(column);
-      continue;
-    }
+  const removing = payload.eventType === 'DELETE';
+  const rowId = removing ? payload.old[primaryKey] : payload.new[primaryKey];
 
-    columns.push(column);
-    parameters.push(value);
+  if (removing) {
+    // Typed by the column it is compared against, unlike the text copy the
+    // guard below needs for its jsonb lookup.
+    parameters.push(rowId);
+  } else {
+    for (const [column, value] of Object.entries(payload.new)) {
+      // A column the server has and this client does not. Naming it in the
+      // statement would fail the whole change with 42703, so it is left out and
+      // handed back for the caller to report.
+      if (!local.includes(column)) {
+        ignored.push(column);
+        continue;
+      }
+
+      columns.push(column);
+      parameters.push(value);
+    }
   }
 
-  let query: string;
+  // The row is left alone while a local change to it is still queued. Since an
+  // upload sends the whole row, that queued change is about to overwrite this
+  // one upstream anyway - dropping it here just means local and remote agree
+  // now rather than after the round trip.
+  parameters.push(payload.table, primaryKey, String(rowId));
 
-  if (payload.eventType === 'INSERT') {
-    query = `
-      INSERT INTO ${escapeIdentifier(payload.schema, payload.table)} (
+  const unchanged = `
+    NOT EXISTS (
+      SELECT 1 FROM supapower.changes
+      WHERE table_name = $${parameters.length - 2}
+        AND COALESCE(new_data, old_data) ->> $${parameters.length - 1} = $${parameters.length}
+    )`;
+
+  const table = escapeIdentifier(payload.schema, payload.table);
+
+  const query = removing
+    ? `
+      DELETE FROM ${table}
+      WHERE ${escapeIdentifier(primaryKey)} = $1
+        AND ${unchanged}
+    `
+    : // INSERT and UPDATE are the same statement: the payload carries the whole
+      // new row either way, and upserting makes an update land even when the
+      // row was never inserted locally - a missed insert would otherwise leave
+      // an UPDATE matching nothing at all.
+      `
+      INSERT INTO ${table} (
         ${columns.map((column) => escapeIdentifier(column)).join(',\n        ')}
       )
-      VALUES (
+      SELECT
         ${columns.map((_, index) => `$${index + 1}`).join(',\n        ')}
-      )
+      WHERE ${unchanged}
       ON CONFLICT (${escapeIdentifier(primaryKey)}) DO UPDATE SET
         ${columns.map((column) => `${escapeIdentifier(column)} = EXCLUDED.${escapeIdentifier(column)}`).join(',\n        ')}
     `;
-  } else if (payload.eventType === 'UPDATE') {
-    parameters.push(payload.old[primaryKey]);
-    query = `
-      UPDATE
-        ${escapeIdentifier(payload.schema, payload.table)}
-      SET
-        ${columns.map((column, index) => `${escapeIdentifier(column)} = $${index + 1}`).join(',\n        ')}
-      WHERE
-        ${escapeIdentifier(primaryKey)} = $${parameters.length}
-    `;
-  } else if (payload.eventType === 'DELETE') {
-    parameters.length = 0;
-    parameters.push(payload.old[primaryKey]);
-    query = `DELETE FROM ${escapeIdentifier(payload.schema, payload.table)} WHERE ${escapeIdentifier(primaryKey)} = $${parameters.length}`;
-  }
 
   await executeInTransaction(pg, async (tx) => {
     await tx.sql`SELECT set_config('supapower.applying', 'true', true)`;

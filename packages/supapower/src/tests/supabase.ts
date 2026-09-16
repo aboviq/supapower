@@ -41,6 +41,8 @@ export interface FakeRealtimeChannel {
 export interface FakeSupabase {
   /** Every write issued, as `"<operation>:<table>"`, in order. */
   readonly calls: string[];
+  /** The payload of every write, in the same order as the `calls` that carry one. */
+  readonly payloads: Array<Record<string, unknown>>;
   /** Every `select` issued, as `"<table>:<columns>"`, in order. */
   readonly requestedColumns: string[];
   /** Every channel opened, in order, whether or not it is still open. */
@@ -48,7 +50,14 @@ export interface FakeSupabase {
   /** The channel that is currently open, if any. */
   readonly openChannel: FakeRealtimeChannel | undefined;
   from(table: string): {
-    upsert(): Promise<{ error: ResponseError | null; count: number | null }>;
+    upsert(row: Record<string, unknown>): Promise<{
+      error: ResponseError | null;
+      count: number | null;
+    }>;
+    update(
+      row: Record<string, unknown>,
+      options?: { count?: string },
+    ): { eq(): Promise<{ error: ResponseError | null; count: number | null }> };
     delete(options?: { count?: string }): {
       eq(): Promise<{ error: ResponseError | null; count: number | null }>;
     };
@@ -82,12 +91,14 @@ export interface FakeSupabaseOptions {
   /** How the n:th write is answered. Defaults to accepting everything. */
   respond?: Respond;
   /**
-   * How many rows a `delete()` reports removing. Defaults to one.
+   * How many rows a `delete()` or `update()` reports touching. Defaults to one.
    *
-   * Zero is what row-level security refusing a delete looks like: the row is
+   * Zero is what row-level security refusing a write looks like: the row is
    * filtered out of the `USING` clause rather than raising.
    */
   deletedRows?: (table: string) => number | null;
+  /** How many rows an `update()` reports touching. Defaults to `deletedRows`. */
+  updatedRows?: (table: string) => number | null;
   /** What `select()` returns per table. Defaults to an empty table. */
   rows?: Record<string, Array<Record<string, unknown>>>;
   /** Fails `select()` for the tables it answers for. */
@@ -206,19 +217,26 @@ function createChannel(name: string): FakeRealtimeChannel {
 export function createFakeSupabase({
   respond = () => null,
   deletedRows = () => 1,
+  updatedRows,
   rows = {},
   downloadError = () => null,
   user = null,
   auth = true,
 }: FakeSupabaseOptions = {}): FakeSupabase {
   const calls: string[] = [];
+  const payloads: Array<Record<string, unknown>> = [];
   const requestedColumns: string[] = [];
   const channels: FakeRealtimeChannel[] = [];
   const listeners = new Set<AuthCallback>();
   let currentUser = user;
 
-  const record = (operation: string, count: number | null) => {
+  const record = (
+    operation: string,
+    count: number | null,
+    payload: Record<string, unknown> = {},
+  ) => {
     calls.push(operation);
+    payloads.push(payload);
 
     return Promise.resolve({ error: respond(calls.length - 1), count });
   };
@@ -256,13 +274,17 @@ export function createFakeSupabase({
 
   const supabase: FakeSupabase = {
     calls,
+    payloads,
     requestedColumns,
     channels,
     get openChannel() {
       return channels.findLast((channel) => !channel.removed);
     },
     from: (table: string) => ({
-      upsert: () => record(`upsert:${table}`, null),
+      upsert: (row: Record<string, unknown>) => record(`upsert:${table}`, null, row),
+      update: (row: Record<string, unknown>) => ({
+        eq: () => record(`update:${table}`, (updatedRows ?? deletedRows)(table), row),
+      }),
       delete: () => ({ eq: () => record(`delete:${table}`, deletedRows(table)) }),
       select: (requested = '*') =>
         createSelect(table, rows[table] ?? [], downloadError, calls, requested, requestedColumns),

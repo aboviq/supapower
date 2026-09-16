@@ -175,3 +175,70 @@ describe('handleIncomingChange', () => {
     expect(await rowsOf('SELECT id FROM todos')).toEqual([]);
   });
 });
+
+describe('handleIncomingChange - a row with a local change still queued', () => {
+  /** Queues an outgoing change the way the trigger would. */
+  const queueLocalEdit = (table: string, row: Row) =>
+    pg.exec(`
+      INSERT INTO supapower.changes (table_name, tx_id, operation, new_data)
+      VALUES ('${table}', pg_current_xact_id(), 'UPDATE', '${JSON.stringify(row)}'::jsonb);
+    `);
+
+  test('leaves the row alone rather than overwriting the local edit', async () => {
+    await pg.exec(`INSERT INTO todos VALUES ('${ONE}', 'mine', false);`);
+    await queueLocalEdit('todos', { id: ONE, title: 'mine', done: false });
+
+    await apply(update('todos', { id: ONE, title: 'theirs', done: true }, { id: ONE }));
+
+    expect(await rowsOf('SELECT title, done FROM todos')).toEqual([{ title: 'mine', done: false }]);
+  });
+
+  test('leaves a remote delete alone too', async () => {
+    await pg.exec(`INSERT INTO todos VALUES ('${ONE}', 'mine', false);`);
+    await queueLocalEdit('todos', { id: ONE, title: 'mine', done: false });
+
+    await apply(remove('todos', { id: ONE }));
+
+    expect(await rowsOf('SELECT title FROM todos')).toEqual([{ title: 'mine' }]);
+  });
+
+  test('applies to other rows of the same table', async () => {
+    await pg.exec(
+      `INSERT INTO todos VALUES ('${ONE}', 'mine', false), ('${TWO}', 'theirs', false);`,
+    );
+    await queueLocalEdit('todos', { id: ONE, title: 'mine', done: false });
+
+    await apply(update('todos', { id: TWO, title: 'edited remotely', done: true }, { id: TWO }));
+
+    expect(await rowsOf<{ title: string }>('SELECT title FROM todos ORDER BY title')).toEqual([
+      { title: 'edited remotely' },
+      { title: 'mine' },
+    ]);
+  });
+
+  test('applies again once the local change has been pushed', async () => {
+    await pg.exec(`INSERT INTO todos VALUES ('${ONE}', 'mine', false);`);
+    await queueLocalEdit('todos', { id: ONE, title: 'mine', done: false });
+
+    await apply(update('todos', { id: ONE, title: 'first try', done: true }, { id: ONE }));
+
+    // What the outgoing sync does when the batch has gone upstream.
+    await pg.exec(`DELETE FROM supapower.changes;`);
+
+    await apply(update('todos', { id: ONE, title: 'second try', done: true }, { id: ONE }));
+
+    expect(await rowsOf('SELECT title FROM todos')).toEqual([{ title: 'second try' }]);
+  });
+});
+
+describe('handleIncomingChange - an update for a row that is not here', () => {
+  test('inserts it, rather than matching nothing', async () => {
+    // An insert missed while offline leaves the client without the row, and a
+    // plain UPDATE would quietly affect nothing at all.
+    await apply(update('todos', { id: ONE, title: 'edited remotely', done: true }, { id: ONE }));
+
+    expect(await rowsOf('SELECT id, title FROM todos')).toEqual([
+      { id: ONE, title: 'edited remotely' },
+    ]);
+  });
+});

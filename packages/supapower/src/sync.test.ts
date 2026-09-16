@@ -9,6 +9,9 @@ import { asPGlite, createFakePGlite } from './tests/pglite.js';
 import { asSupabaseClient, createFakeSupabase } from './tests/supabase.js';
 import { resolveTablesWith } from './tests/tables.js';
 
+const edit = (before: Record<string, unknown>, after: Record<string, unknown>) =>
+  createChange('100', 1, { operation: 'UPDATE', old_data: before, new_data: after });
+
 const remove = (txId: string, id: number) =>
   createChange(txId, id, {
     operation: 'DELETE',
@@ -214,5 +217,102 @@ describe('runOutgoingSync - a DELETE that matched nothing', () => {
     await running;
 
     expect(errors).toEqual([]);
+  });
+});
+
+describe('runOutgoingSync - what an update sends', () => {
+  const tables = resolveTablesWith(['todos'], { todos: ['id', 'done', 'title'] });
+
+  const drain = async (
+    pg: ReturnType<typeof createFakePGlite>,
+    supabase: ReturnType<typeof createFakeSupabase>,
+  ) => {
+    const controller = new AbortController();
+
+    const running = runOutgoingSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: controller.signal,
+    });
+
+    expect(await waitFor(() => pg.queue.length === 0)).toBe(true);
+    controller.abort();
+    await running;
+  };
+
+  test('sends only the columns that changed', async () => {
+    const pg = createFakePGlite({
+      changes: [
+        edit({ id: 1, title: 'one', done: false }, { id: 1, title: 'edited', done: false }),
+      ],
+    });
+    const supabase = createFakeSupabase();
+
+    await drain(pg, supabase);
+
+    // Sending "done" as well would replace whatever somebody else did to it.
+    expect(supabase.calls).toEqual(['update:todos']);
+    expect(supabase.payloads[0]).toEqual({ title: 'edited' });
+  });
+
+  test('ignores a column edited back to what it was', async () => {
+    const pg = createFakePGlite({
+      changes: [edit({ id: 1, title: 'one', done: true }, { id: 1, title: 'one', done: false })],
+    });
+    const supabase = createFakeSupabase();
+
+    await drain(pg, supabase);
+
+    expect(supabase.payloads[0]).toEqual({ done: false });
+  });
+
+  test('sends nothing at all when no column moved', async () => {
+    const pg = createFakePGlite({
+      changes: [edit({ id: 1, title: 'one' }, { id: 1, title: 'one' })],
+    });
+    const supabase = createFakeSupabase();
+
+    await drain(pg, supabase);
+
+    expect(supabase.calls).toEqual([]);
+    expect(pg.queue).toEqual([]);
+  });
+
+  test('compares nested values without tripping over key order', async () => {
+    const pg = createFakePGlite({
+      changes: [edit({ id: 1, meta: { a: 1, b: 2 } }, { id: 1, meta: { a: 1, b: 2 } })],
+    });
+    const supabase = createFakeSupabase();
+
+    await drain(pg, supabase);
+
+    // jsonb normalizes key order on both sides, so these really are equal.
+    expect(supabase.calls).toEqual([]);
+  });
+
+  test('falls back to the whole row when the update matched nothing', async () => {
+    const pg = createFakePGlite({
+      changes: [
+        edit({ id: 1, title: 'one', done: false }, { id: 1, title: 'edited', done: false }),
+      ],
+    });
+    // The insert that should have created the row upstream never landed.
+    const supabase = createFakeSupabase({ updatedRows: () => 0 });
+
+    await drain(pg, supabase);
+
+    expect(supabase.calls).toEqual(['update:todos', 'upsert:todos']);
+    expect(supabase.payloads[1]).toEqual({ id: 1, title: 'edited', done: false });
+  });
+
+  test('still sends the whole row for an insert', async () => {
+    const pg = createFakePGlite({ changes: [createChange('100', 1)] });
+    const supabase = createFakeSupabase();
+
+    await drain(pg, supabase);
+
+    expect(supabase.calls).toEqual(['upsert:todos']);
+    expect(supabase.payloads[0]).toEqual({ id: 1, title: 'write tests' });
   });
 });
