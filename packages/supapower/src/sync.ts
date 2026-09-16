@@ -16,7 +16,12 @@ import {
   type UnrecoverableUploadError,
 } from './changes.js';
 import { CHANGES_CHANNEL } from './constants.js';
-import { isUnrecoverableUploadError, SupapowerError, SupapowerUploadError } from './errors.js';
+import {
+  asSupapowerError,
+  isUnrecoverableUploadError,
+  SupapowerError,
+  SupapowerUploadError,
+} from './errors.js';
 import {
   clearSyncedCursorAt,
   clearSyncedIncomingAt,
@@ -198,7 +203,7 @@ export interface OutgoingSyncOptions {
   /** Handles batches Supabase rejects for good. Defaults to discarding them. */
   onUnrecoverableError?: (context: UnrecoverableUploadError) => void | Promise<void>;
   /** Called when a batch could not be pushed, before the retry is scheduled. */
-  onError?: (error: unknown) => void;
+  onError?: (error: SupapowerError) => void;
 }
 
 /**
@@ -305,7 +310,7 @@ export async function runOutgoingSync({
         return;
       }
 
-      onError?.(error);
+      onError?.(asSupapowerError(error, 'The outgoing sync failed', 'upload_failed'));
 
       await backOff(signal, attempt);
 
@@ -561,7 +566,7 @@ export interface IncomingSyncOptions {
   /** Overrides the generated channel name. */
   channel?: string;
   /** Called when a change could not be applied, or the channel reports trouble. */
-  onError?: (error: unknown) => void;
+  onError?: (error: SupapowerError) => void;
 }
 
 /**
@@ -612,7 +617,7 @@ export async function runIncomingSync({
         await task();
       } catch (error: unknown) {
         // Caught per task so one bad row cannot break the chain for the rest.
-        onError?.(error);
+        onError?.(asSupapowerError(error, 'Could not apply a remote change', 'apply_failed'));
       }
     })();
   };
@@ -645,10 +650,11 @@ export async function runIncomingSync({
       // CHANNEL_ERROR and TIMED_OUT are reported but not acted on: realtime-js
       // rejoins on its own, and tearing the channel down here would fight it.
       onError?.(
-        error
-          ?? new SupapowerError(`Realtime channel "${channel}" reported ${status}`, {
-            code: 'connection_failed',
-          }),
+        asSupapowerError(
+          error,
+          `Realtime channel "${channel}" reported ${status}`,
+          'connection_failed',
+        ),
       );
     });
   });

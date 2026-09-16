@@ -7,11 +7,18 @@ import type { PostgrestError } from '@supabase/supabase-js';
  * removed in a major release.
  */
 export type SupapowerErrorCode =
+  /** A remote change could not be written into the local database. */
+  | 'apply_failed'
+  /** A realtime channel could not be reached or stay joined. */
   | 'connection_failed'
+  /** Supabase accepted a `DELETE` that matched no row. */
   | 'delete_ignored'
+  /** Reading from Supabase failed. */
   | 'download_failed'
   | 'not_initialized'
+  /** A queued change names a table that is not configured for syncing. */
   | 'schema_mismatch'
+  /** Anything that went wrong on the way out, local queue included. */
   | 'upload_failed';
 
 export interface SupapowerErrorOptions extends ErrorOptions {
@@ -66,6 +73,25 @@ export function isSupapowerUploadError(value: unknown): value is SupapowerUpload
 }
 
 /**
+ * Wraps anything that is not already a {@link SupapowerError}.
+ *
+ * Everything Supapower hands to a callback goes through here, so a handler can
+ * always read `code` and reach the original failure through `cause` rather than
+ * having to narrow an `unknown` first.
+ *
+ * @param value The thrown value to wrap.
+ * @param message Describes what Supapower was doing when it failed.
+ * @param code The code to give the wrapper.
+ */
+export function asSupapowerError(
+  value: unknown,
+  message: string,
+  code: SupapowerErrorCode,
+): SupapowerError {
+  return isSupapowerError(value) ? value : new SupapowerError(message, { code, cause: value });
+}
+
+/**
  * Postgres response codes that retrying cannot fix.
  *
  * A batch rejected with one of these is rejected the same way every time, so
@@ -92,7 +118,7 @@ const FATAL_RESPONSE_CODES = [
  *
  * Exported so a custom `onUnrecoverableError` can classify further.
  */
-export function isUnrecoverableUploadError(value: unknown): boolean {
+export function isUnrecoverableUploadError(value: unknown): value is SupapowerUploadError {
   if (!isSupapowerUploadError(value)) {
     return false;
   }

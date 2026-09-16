@@ -2,6 +2,7 @@ import type { PGliteInterface } from '@electric-sql/pglite';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import type { UnrecoverableUploadError } from './changes.js';
+import type { SupapowerError } from './errors.js';
 import { createLeadership } from './leadership.js';
 import { runMigrations, trackTables } from './migrations.js';
 import {
@@ -56,7 +57,7 @@ interface SyncSupervisorOptions {
   /** Aborted when leadership is lost or the sync is unsubscribed. */
   signal: AbortSignal;
   onUnrecoverableError?: (context: UnrecoverableUploadError) => void | Promise<void>;
-  onError?: (error: unknown) => void;
+  onError?: (error: SupapowerError) => void;
 }
 
 /** The tables that are reachable for a given identity. */

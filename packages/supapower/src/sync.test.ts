@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import type { UnrecoverableUploadError } from './changes.js';
-import { isSupapowerError, isUnrecoverableUploadError, SupapowerError } from './errors.js';
+import { isUnrecoverableUploadError, type SupapowerError } from './errors.js';
 import { resolveTables, runOutgoingSync } from './sync.js';
 import { waitFor } from './tests/async.js';
 import { createChange } from './tests/changes.js';
@@ -43,7 +43,7 @@ describe('runOutgoingSync', () => {
       respond: () => ({ code: '23505', message: 'duplicate key' }),
     });
     const controller = new AbortController();
-    const errors: unknown[] = [];
+    const errors: SupapowerError[] = [];
 
     const running = runOutgoingSync({
       pg: asPGlite(pg),
@@ -67,7 +67,7 @@ describe('runOutgoingSync', () => {
     const pg = createFakePGlite({ changes: [createChange('100', 1)] });
     const supabase = createFakeSupabase({ respond: () => ({ code: '08006', message: 'offline' }) });
     const controller = new AbortController();
-    const errors: unknown[] = [];
+    const errors: SupapowerError[] = [];
 
     const running = runOutgoingSync({
       pg: asPGlite(pg),
@@ -82,7 +82,7 @@ describe('runOutgoingSync', () => {
     await running;
 
     expect(pg.queue).toHaveLength(1);
-    expect(errors[0]).toBeInstanceOf(SupapowerError);
+    expect(errors[0]?.code).toBe('upload_failed');
   });
 
   test('hands a rejected batch to a custom handler', async () => {
@@ -122,7 +122,7 @@ describe('runOutgoingSync', () => {
       respond: () => ({ code: '23502', message: 'not null' }),
     });
     const controller = new AbortController();
-    const errors: unknown[] = [];
+    const errors: SupapowerError[] = [];
     let handled = 0;
 
     const running = runOutgoingSync({
@@ -154,7 +154,7 @@ describe('runOutgoingSync - a DELETE that matched nothing', () => {
     // out of the USING clause rather than the request failing.
     const supabase = createFakeSupabase({ deletedRows: () => 0 });
     const controller = new AbortController();
-    const errors: unknown[] = [];
+    const errors: SupapowerError[] = [];
 
     const running = runOutgoingSync({
       pg: asPGlite(pg),
@@ -169,14 +169,15 @@ describe('runOutgoingSync - a DELETE that matched nothing', () => {
     await running;
 
     expect(errors).toHaveLength(1);
-    expect(isSupapowerError(errors[0]) && errors[0].code).toBe('delete_ignored');
+    // No narrowing needed: everything reaching onError is a SupapowerError.
+    expect(errors[0]?.code).toBe('delete_ignored');
   });
 
   test('says nothing when a row was actually removed', async () => {
     const pg = createFakePGlite({ changes: [remove('100', 1)] });
     const supabase = createFakeSupabase();
     const controller = new AbortController();
-    const errors: unknown[] = [];
+    const errors: SupapowerError[] = [];
 
     const running = runOutgoingSync({
       pg: asPGlite(pg),
@@ -197,7 +198,7 @@ describe('runOutgoingSync - a DELETE that matched nothing', () => {
     const pg = createFakePGlite({ changes: [remove('100', 1)] });
     const supabase = createFakeSupabase({ deletedRows: () => null });
     const controller = new AbortController();
-    const errors: unknown[] = [];
+    const errors: SupapowerError[] = [];
 
     const running = runOutgoingSync({
       pg: asPGlite(pg),

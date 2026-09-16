@@ -213,7 +213,7 @@ interface SupapowerSyncOptions {
    *
    * Without it every one of those passes silently.
    */
-  onError?: (error: unknown) => void;
+  onError?: (error: SupapowerError) => void;
 }
 ```
 
@@ -366,8 +366,8 @@ const sync = await pg.supapower.sync({
 
 ```ts
 interface UnrecoverableUploadError {
-  /** The error Supabase returned, as the cause of a `SupapowerUploadError`. */
-  readonly error: unknown;
+  /** The failure, with the PostgREST error itself as `error.cause`. */
+  readonly error: SupapowerUploadError;
   /** Every change in the local transaction that failed, in order. */
   readonly batch: Readonly<ChangeRow[]>;
   /** The change that was rejected. */
@@ -393,20 +393,42 @@ again.
 
 Anything that goes wrong without stopping the sync goes to `onError`, and without it passes silently:
 an upload or download that failed and will be retried, a realtime channel reporting trouble, a change
-that could not be applied locally, and a `DELETE` that matched no row upstream. Each error carries a
-`SupapowerErrorCode` you can switch on.
+that could not be applied locally, and a `DELETE` that matched no row upstream.
+
+It is always a `SupapowerError`, never a bare `unknown`. Whatever was actually thrown - a `TypeError`
+from `fetch`, a PGlite error, a string - is wrapped and kept as `cause`, so there is a `code` to
+switch on without narrowing anything first:
 
 ```ts
 const sync = await pg.supapower.sync({
   supabase,
   tables: ['todos'],
   onError: (error) => {
-    if (isSupapowerError(error) && error.code === 'delete_ignored') {
-      // Local and remote have diverged; the row is still upstream.
+    switch (error.code) {
+      case 'delete_ignored':
+        // Local and remote have diverged; the row is still upstream.
+        break;
+      case 'connection_failed':
+        setOffline(true);
+        break;
+      default:
+        report(error.message, { cause: error.cause });
     }
   },
 });
 ```
+
+| `code`              | What happened                                                    |
+| ------------------- | ---------------------------------------------------------------- |
+| `upload_failed`     | Something in the outgoing pipeline failed and will be retried    |
+| `download_failed`   | Reading from Supabase failed                                     |
+| `apply_failed`      | A remote change could not be written into the local database     |
+| `connection_failed` | The realtime channel could not be reached or stay joined         |
+| `delete_ignored`    | Supabase accepted a `DELETE` that matched no row                 |
+| `schema_mismatch`   | A queued change names a table that is not configured for syncing |
+
+`asSupapowerError(value, message, code)` from `supapower/errors` is the same wrapper, if you want to
+funnel your own failures into the same shape.
 
 That last one is worth knowing about. Row-level security refuses a delete by filtering the row out of
 the policy's `USING` clause, not by raising, so a denied `DELETE` comes back as a perfectly ordinary
@@ -428,7 +450,7 @@ go-to-definition lands on the definition rather than on a re-export.
 | `supapower`            | `supapower` (the extension), `createSupapower`                                         |
 | `supapower/types`      | `SupapowerSyncOptions`, `SupapowerSync`, `SupapowerTableConfig`, `PGliteWithSupapower` |
 | `supapower/changes`    | `ChangeRow`, `UnrecoverableUploadError`, `SyncTransaction`                             |
-| `supapower/errors`     | `SupapowerError`, `SupapowerUploadError`, `isUnrecoverableUploadError`                 |
+| `supapower/errors`     | `SupapowerError`, `SupapowerUploadError`, `asSupapowerError`, the guards and codes     |
 | `supapower/leadership` | `createLeadership` and the individual strategies                                       |
 
 `createSupapower(pg)` is the same code path as the extension, for when registering an extension is

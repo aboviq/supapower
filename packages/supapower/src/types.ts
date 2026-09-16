@@ -2,6 +2,7 @@ import type { PGliteInterface } from '@electric-sql/pglite';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import type { UnrecoverableUploadError } from './changes.js';
+import type { SupapowerError } from './errors.js';
 import type { LeadershipStrategy } from './leadership.js';
 
 export interface SupapowerTableConfig {
@@ -124,10 +125,13 @@ export interface SupapowerSyncOptions {
    * refuses a delete, since it filters the row out rather than raising.
    *
    * Purely for reporting: the sync carries on either way, and without this
-   * callback every one of those passes silently. Errors carry a
-   * {@link SupapowerErrorCode} you can switch on.
+   * callback every one of those passes silently.
+   *
+   * Anything that is not already a `SupapowerError` is wrapped in one, so
+   * `code` is always there to switch on and the original failure is always
+   * reachable through `cause`.
    */
-  onError?: (error: unknown) => void;
+  onError?: (error: SupapowerError) => void;
 }
 
 export interface SupapowerSync {

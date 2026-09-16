@@ -9,6 +9,7 @@
 
 import type { PGliteInterface } from '@electric-sql/pglite';
 
+import type { SupapowerUploadError } from './errors.js';
 import { once } from './utils.js';
 
 export interface InsertChange {
@@ -71,8 +72,8 @@ export interface SyncTransaction {
  * to the rejected changes. See {@link SupapowerSyncOptions.onUnrecoverableError}.
  */
 export interface UnrecoverableUploadError {
-  /** The error Supabase returned, wrapped in a `SupapowerError`. */
-  readonly error: unknown;
+  /** The error Supabase returned, wrapped so `error.cause` is the PostgREST one. */
+  readonly error: SupapowerUploadError;
   /** Every change in the local transaction that failed, in order. */
   readonly batch: Readonly<ChangeRow[]>;
   /**

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
+import type { SupapowerError } from './errors.js';
 import { resolveTables, runIncomingSync } from './sync.js';
 import { settle, waitFor } from './tests/async.js';
 import { asPGlite, createFakePGlite } from './tests/pglite.js';
@@ -156,7 +157,7 @@ describe('runIncomingSync', () => {
   test('reports channel trouble without tearing the subscription down', async () => {
     const supabase = createFakeSupabase();
     const controller = new AbortController();
-    const errors: unknown[] = [];
+    const errors: SupapowerError[] = [];
 
     const running = runIncomingSync({
       pg: asPGlite(createFakePGlite()),
@@ -171,6 +172,7 @@ describe('runIncomingSync', () => {
     channel?.report('TIMED_OUT');
 
     expect(errors).toHaveLength(1);
+    expect(errors[0]?.code).toBe('connection_failed');
     // realtime-js rejoins on its own; tearing it down here would fight that.
     expect(channel?.removed).toBe(false);
 
