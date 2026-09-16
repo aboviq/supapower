@@ -164,7 +164,7 @@ Creates a `supapower` schema in the database with a generic `supapower.changes` 
 
 For each tracked table a statement trigger is attached for `INSERT`, `UPDATE` and `DELETE` operations that adds a row to sync to the `supapower.changes` table.
 
-When the database is set up the sync is started. The outgoing queue is drained one local transaction at a time using the provided `supabase` client, and the loop is woken by a `NOTIFY` from the change trigger rather than by polling.
+When the database is set up the sync is started. The outgoing queue is drained one local transaction at a time using the provided `supabase` client, and the loop is woken by a `NOTIFY` from the change trigger or by a periodic poll as a fallback.
 
 A realtime channel subscription is also set up on the provided `supabase` client to track remote changes to the tracked tables, and an initial download brings the local tables up to date behind it. Incoming changes are applied in the order they were broadcast, with the change triggers suppressed so an incoming change is not queued straight back up as an outgoing one. A row whose local change is still waiting in the outgoing queue is left as it is - see [Conflicts](#conflicts).
 

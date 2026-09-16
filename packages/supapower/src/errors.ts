@@ -15,13 +15,12 @@ export type SupapowerErrorCode =
   | 'connection_failed'
   /** Supabase accepted a `DELETE` that matched no row. */
   | 'delete_ignored'
-  /** Supabase accepted an `UPDATE` that matched no row. */
-  | 'update_ignored'
   /** Reading from Supabase failed. */
   | 'download_failed'
-  | 'not_initialized'
   /** A queued change names a table that is not configured for syncing. */
   | 'schema_mismatch'
+  /** Supabase accepted an `UPDATE` that matched no row. */
+  | 'update_ignored'
   /** Anything that went wrong on the way out, local queue included. */
   | 'upload_failed';
 

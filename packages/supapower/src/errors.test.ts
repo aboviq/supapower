@@ -22,7 +22,7 @@ describe('SupapowerError', () => {
   });
 
   test('is an Error', () => {
-    const error = new SupapowerError('Not initialized', { code: 'not_initialized' });
+    const error = new SupapowerError('Could not reach Supabase', { code: 'connection_failed' });
 
     expect(error).toBeInstanceOf(Error);
   });
