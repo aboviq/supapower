@@ -53,7 +53,7 @@ describe('isUnrecoverableUploadError', () => {
 
   test('rejects transient failures', () => {
     expect(isUnrecoverableUploadError(uploadError('08006'))).toBe(false); // connection failure
-    expect(isUnrecoverableUploadError(uploadError('57014'))).toBe(false); // query cancelled
+    expect(isUnrecoverableUploadError(uploadError('57014'))).toBe(false); // query canceled
     expect(isUnrecoverableUploadError(new Error('Failed to fetch'))).toBe(false);
     expect(isUnrecoverableUploadError(undefined)).toBe(false);
   });

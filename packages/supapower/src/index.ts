@@ -17,7 +17,7 @@ import type { SupapowerNamespace, SupapowerSync, SupapowerSyncOptions } from './
 /** Stands in for a client whose token the application owns. */
 const EXTERNAL_AUTH = Symbol('external-auth');
 
-/** What {@link EXTERNAL_AUTH} is recorded as, so a reload recognises it again. */
+/** What {@link EXTERNAL_AUTH} is recorded as, so a reload recognizes it again. */
 const EXTERNAL_USER = 'supapower:external';
 
 /** Who the tables are being synced for. `null` means nobody is signed in. */

@@ -323,15 +323,19 @@ export async function runOutgoingSync({
  * Handles an incoming change from Supabase by applying it to the local database.
  * Supports INSERT, UPDATE, and DELETE events.
  *
+ * `supapower.applying` is set for the transaction so the change triggers skip
+ * it: an incoming change must not be queued straight back up as an outgoing
+ * one. The watermark moves in the same transaction as the row itself.
+ *
  * @param pg The PGlite interface or transaction to execute the change within.
  * @param payload The payload describing the incoming change from Supabase.
  * @param primaryKey The primary key column of the table being changed.
  */
-async function handleIncomingChange(
+export async function handleIncomingChange(
   pg: PGliteInterface | Transaction,
   payload: RealtimePostgresChangesPayload<Record<string, unknown>>,
   primaryKey: string,
-) {
+): Promise<void> {
   const columns: string[] = [];
   const parameters: unknown[] = [];
 
