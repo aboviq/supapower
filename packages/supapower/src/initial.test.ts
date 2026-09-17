@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
+import { createSupapowerEvents } from './events.js';
 import { reconcileUser, runInitialSync } from './sync.js';
 import { createChange } from './tests/changes.js';
 import { asPGlite, createFakePGlite } from './tests/pglite.js';
@@ -29,6 +30,39 @@ describe('runInitialSync', () => {
     });
 
     expect(supabase.calls).toEqual(['select:todos', 'select:plans']);
+  });
+
+  test('dispatches download events around each table, in order', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase();
+    const events = createSupapowerEvents();
+    const seen: string[] = [];
+
+    events.addEventListener('downloadStart', () => seen.push('downloadStart'));
+    events.addEventListener('downloadTableStart', (event) =>
+      seen.push(`start:${event.config.table}`),
+    );
+    events.addEventListener('downloadTableFinish', (event) =>
+      seen.push(`finish:${event.config.table}`),
+    );
+    events.addEventListener('downloadFinish', () => seen.push('downloadFinish'));
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: live(),
+      events,
+    });
+
+    expect(seen).toEqual([
+      'downloadStart',
+      'start:todos',
+      'finish:todos',
+      'start:plans',
+      'finish:plans',
+      'downloadFinish',
+    ]);
   });
 
   test('writes the downloaded rows in as upserts, with the trigger suppressed', async () => {

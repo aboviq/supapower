@@ -44,6 +44,10 @@
       "types": "./dist/errors.d.ts",
       "default": "./dist/errors.js"
     },
+    "./events": {
+      "types": "./dist/events.d.ts",
+      "default": "./dist/events.js"
+    },
     "./leadership": {
       "types": "./dist/leadership.d.ts",
       "default": "./dist/leadership.js"

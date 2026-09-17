@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import type { SupapowerError } from './errors.js';
+import { createSupapowerEvents } from './events.js';
 import { runIncomingSync } from './sync.js';
 import { settle, waitFor } from './tests/async.js';
 import { asPGlite, createFakePGlite } from './tests/pglite.js';
@@ -160,13 +161,16 @@ describe('runIncomingSync', () => {
     const supabase = createFakeSupabase();
     const controller = new AbortController();
     const errors: SupapowerError[] = [];
+    const events = createSupapowerEvents();
+
+    events.addEventListener('error', (event) => errors.push(event.error));
 
     const running = runIncomingSync({
       pg: asPGlite(createFakePGlite()),
       supabase: asSupabaseClient(supabase),
       tables,
       signal: controller.signal,
-      onError: (error) => errors.push(error),
+      events,
     });
 
     const channel = supabase.openChannel;
@@ -181,6 +185,70 @@ describe('runIncomingSync', () => {
     controller.abort();
     await running;
   });
+
+  test('dispatches connect on subscribe and disconnect on trouble, once each', async () => {
+    const supabase = createFakeSupabase();
+    const controller = new AbortController();
+    const events = createSupapowerEvents();
+    const seen: string[] = [];
+
+    events.addEventListener('connect', () => seen.push('connect'));
+    events.addEventListener('disconnect', () => seen.push('disconnect'));
+
+    const running = runIncomingSync({
+      pg: asPGlite(createFakePGlite()),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: controller.signal,
+      events,
+    });
+
+    const channel = supabase.openChannel;
+
+    expect(seen).toEqual(['connect']);
+
+    // Two hiccups in a row are one disconnect, not two: already down.
+    channel?.report('TIMED_OUT');
+    channel?.report('CHANNEL_ERROR');
+
+    expect(seen).toEqual(['connect', 'disconnect']);
+
+    channel?.report('SUBSCRIBED');
+
+    expect(seen).toEqual(['connect', 'disconnect', 'connect']);
+
+    controller.abort();
+    await running;
+
+    // Torn down while connected: one last disconnect closes the pair.
+    expect(seen).toEqual(['connect', 'disconnect', 'connect', 'disconnect']);
+  });
+
+  test('dispatches no extra disconnect when already disconnected at teardown', async () => {
+    const supabase = createFakeSupabase();
+    const controller = new AbortController();
+    const events = createSupapowerEvents();
+    const seen: string[] = [];
+
+    events.addEventListener('disconnect', () => seen.push('disconnect'));
+
+    const running = runIncomingSync({
+      pg: asPGlite(createFakePGlite()),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: controller.signal,
+      events,
+    });
+
+    supabase.openChannel?.report('TIMED_OUT');
+
+    expect(seen).toEqual(['disconnect']);
+
+    controller.abort();
+    await running;
+
+    expect(seen).toEqual(['disconnect']);
+  });
 });
 
 describe('runIncomingSync - schema drift', () => {
@@ -189,13 +257,16 @@ describe('runIncomingSync - schema drift', () => {
     const supabase = createFakeSupabase();
     const controller = new AbortController();
     const errors: SupapowerError[] = [];
+    const events = createSupapowerEvents();
+
+    events.addEventListener('error', (event) => errors.push(event.error));
 
     const running = runIncomingSync({
       pg: asPGlite(pg),
       supabase: asSupabaseClient(supabase),
       tables,
       signal: controller.signal,
-      onError: (error) => errors.push(error),
+      events,
     });
 
     const drifted = { id: 1, title: 'one', added_later: 'boom' };

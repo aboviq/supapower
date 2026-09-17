@@ -3,7 +3,7 @@ import { identifier, raw } from '@electric-sql/pglite/template';
 
 import { CHANGES_CHANNEL } from './constants.js';
 import { SupapowerError } from './errors.js';
-import type { ResolvedTableConfig } from './sync.js';
+import type { ResolvedTableConfig } from './types.js';
 import { escapeIdentifier } from './utils.js';
 
 /** The part of a table's configuration the triggers need. */

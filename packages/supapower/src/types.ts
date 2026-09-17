@@ -2,7 +2,7 @@ import type { PGliteInterface } from '@electric-sql/pglite';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import type { UnrecoverableUploadError } from './changes.js';
-import type { SupapowerError } from './errors.js';
+import type { SupapowerEventTarget } from './events.js';
 import type { LeadershipStrategy } from './leadership.js';
 
 export interface SupapowerTableConfig {
@@ -78,6 +78,33 @@ export interface SupapowerTableConfig {
   access?: 'anon' | 'authenticated';
 }
 
+/** A table entry with every default filled in. */
+export interface ResolvedTableConfig extends SupapowerTableConfig {
+  /** The schema the table lives in remotely, in Supabase. */
+  schema: string;
+  /** The schema the table lives in locally, in PGlite. */
+  localSchema: string;
+  primaryKey: string;
+  access: 'anon' | 'authenticated';
+}
+
+/**
+ * A resolved table, described against the local database.
+ *
+ * Only the parts of the sync that read `columns` ask for one; the rest make do
+ * with a {@link ResolvedTableConfig}.
+ */
+export interface SupapowerSyncedTable extends ResolvedTableConfig {
+  /**
+   * The columns the table has in the local database, sorted.
+   *
+   * The application owns the local schema, and it lags behind the remote one
+   * whenever the server deploys first, so this is what an incoming row is
+   * trimmed to fit.
+   */
+  columns: readonly string[];
+}
+
 export interface SupapowerSyncOptions {
   /**
    * Supabase client instance used for syncing data with the remote tables.
@@ -141,22 +168,6 @@ export interface SupapowerSyncOptions {
    * @default Discards the batch.
    */
   onUnrecoverableError?: (context: UnrecoverableUploadError) => void | Promise<void>;
-  /**
-   * Called for anything that went wrong but did not stop the sync.
-   *
-   * A failed upload or download that will be retried, a realtime channel
-   * reporting trouble, a change that could not be applied locally, and a
-   * `DELETE` that matched no row upstream - which is how row-level security
-   * refuses a delete, since it filters the row out rather than raising.
-   *
-   * Purely for reporting: the sync carries on either way, and without this
-   * callback every one of those passes silently.
-   *
-   * Anything that is not already a `SupapowerError` is wrapped in one, so
-   * `code` is always there to switch on and the original failure is always
-   * reachable through `cause`.
-   */
-  onError?: (error: SupapowerError) => void;
 }
 
 export interface SupapowerSync {
@@ -184,6 +195,17 @@ export interface SupapowerSync {
 }
 
 export interface SupapowerNamespace {
+  /**
+   * Events dispatched during the sync: `downloadStart`, `downloadFinish`,
+   * `downloadTableStart`, `downloadTableFinish`, `uploadStart`,
+   * `uploadFinish`, and `error` - the last replacing what used to be the
+   * `onError` option.
+   *
+   * Exists as soon as the namespace does, so listeners can be attached before
+   * `sync()` is ever called - nothing is dispatched until it is.
+   */
+  readonly events: SupapowerEventTarget;
+
   /**
    * Initializes the local database and starts syncing with the remote tables based on the provided options.
    *

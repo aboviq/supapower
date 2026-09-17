@@ -232,12 +232,6 @@ interface SupapowerSyncOptions {
    * @default Discards the batch.
    */
   onUnrecoverableError?: (context: UnrecoverableUploadError) => void | Promise<void>;
-  /**
-   * Called for anything that went wrong but did not stop the sync.
-   *
-   * Without it every one of those passes silently.
-   */
-  onError?: (error: SupapowerError) => void;
 }
 ```
 
@@ -270,7 +264,7 @@ The client's schema is the application's, and it lags behind the remote one when
 Supapower does not treat that as an error:
 
 - The download asks Supabase for the columns it knows by name, so a column it has never heard of is never sent.
-- A realtime change that carries a column unknown to the client has it trimmed off before the row is written, and the column is reported once per session through [`onError`](#everything-else) as `column_ignored`. The rest of the row is still applied.
+- A realtime change that carries a column unknown to the client has it trimmed off before the row is written, and the column is reported once per session through [the `error` event](#supapowerevents) as `column_ignored`. The rest of the row is still applied.
 - An old client never overwrites what it dropped. `upsert` only sets the columns it sends, so a row updated locally keeps the newer column's value upstream.
 
 The value is therefore not lost, only not local yet. Once the application migration adds the column, the stored watermark no longer covers the columns being asked for, and that table is downloaded whole again to fill it in. The same happens if [`cursor`](#table-cursor-configuration) is pointed at a different column than before.
@@ -406,6 +400,47 @@ await pg.supapower.sync({
 });
 ```
 
+### `supapower.events`
+
+An `EventTarget`, typed for the events Supapower dispatches, so listeners can be attached with the
+standard `addEventListener`/`removeEventListener` and more than one can watch the same event.
+
+It exists as soon as `pg.supapower` does, so listeners can be attached before `sync()` is ever
+called - nothing is dispatched until it is:
+
+```ts
+pg.supapower.events.addEventListener('downloadTableStart', (event) => {
+  console.log(`downloading ${event.config.table}...`);
+});
+
+const sync = await pg.supapower.sync({ supabase, tables: ['todos'] });
+```
+
+| Event                 | Fires                                                                                  | Extra          |
+| --------------------- | -------------------------------------------------------------------------------------- | -------------- |
+| `downloadStart`       | An initial (or catch-up) download of every table has started                           |                |
+| `downloadTableStart`  | A single table's download has started                                                  | `event.config` |
+| `downloadTableFinish` | A single table's download has finished                                                 | `event.config` |
+| `downloadFinish`      | An initial (or catch-up) download of every table has finished                          |                |
+| `uploadStart`         | A batch of local changes has started uploading to Supabase                             |                |
+| `uploadFinish`        | A batch of local changes has finished uploading to Supabase                            |                |
+| `connect`             | The realtime channel is subscribed and delivering changes                              |                |
+| `disconnect`          | The realtime channel stopped delivering changes                                        |                |
+| `error`               | Something went wrong but did not stop the sync - see [Error handling](#error-handling) |                |
+
+`downloadTableStart`/`downloadTableFinish` fire once per table on every download, initial or
+catch-up alike; `downloadStart`/`downloadFinish` bracket the whole run. A download that fails
+halfway - reported through `error` - stops short of dispatching a `finish` for the table it was on
+or for the run as a whole; the same table is tried again on the next download.
+
+`uploadStart`/`uploadFinish` bracket one local transaction being pushed upstream, discarded batches
+included - see [Error handling](#error-handling). A batch that stays queued after a transient
+failure gets no `uploadFinish`; it is retried, and brackets its own attempt.
+
+`connect`/`disconnect` only fire on the tab holding leadership, and only on an actual transition -
+a channel that reports trouble more than once in a row without recovering does not get a
+`disconnect` for each report.
+
 ### Multi-tab behavior
 
 Every tab that opens the same PGlite database shares one set of files, and therefore one
@@ -486,33 +521,32 @@ columns it changed, a delete goes by primary key - because a crash between the u
 delete leaves the batch queued for the next leader to send again. See [Conflicts](#conflicts) for
 what an update does about a row somebody else touched in the meantime.
 
-#### Everything else
+#### The `error` event
 
-Anything that goes wrong without stopping the sync goes to `onError`, and without it passes silently:
-an upload or download that failed and will be retried, a realtime channel reporting trouble, a change
-that could not be applied locally, and a `DELETE` that matched no row upstream.
+Anything that goes wrong without stopping the sync is dispatched as an `error` event on
+[`supapower.events`](#supapowerevents), and without a listener every one of those passes silently:
+an upload or download that failed and will be retried, a realtime channel reporting trouble, a
+change that could not be applied locally, and a `DELETE` that matched no row upstream.
 
-It is always a `SupapowerError`, never a bare `unknown`. Whatever was actually thrown - a `TypeError`
-from `fetch`, a PGlite error, a string - is wrapped and kept as `cause`, so there is a `code` to
-switch on without narrowing anything first:
+`event.error` is always a `SupapowerError`, never a bare `unknown`. Whatever was actually thrown - a
+`TypeError` from `fetch`, a PGlite error, a string - is wrapped and kept as `cause`, so there is a
+`code` to switch on without narrowing anything first:
 
 ```ts
-const sync = await pg.supapower.sync({
-  supabase,
-  tables: ['todos'],
-  onError: (error) => {
-    switch (error.code) {
-      case 'delete_ignored':
-        // Local and remote have diverged; the row is still upstream.
-        break;
-      case 'connection_failed':
-        setOffline(true);
-        break;
-      default:
-        report(error.message, { cause: error.cause });
-    }
-  },
+pg.supapower.events.addEventListener('error', ({ error }) => {
+  switch (error.code) {
+    case 'delete_ignored':
+      // Local and remote have diverged; the row is still upstream.
+      break;
+    case 'connection_failed':
+      setOffline(true);
+      break;
+    default:
+      report(error.message, { cause: error.cause });
+  }
 });
+
+const sync = await pg.supapower.sync({ supabase, tables: ['todos'] });
 ```
 
 | `code`              | What happened                                                    |
@@ -548,6 +582,7 @@ Everything needed for the common case is on the package root. The rest is split 
 | `supapower/types`      | `SupapowerSyncOptions`, `SupapowerSync`, `SupapowerTableConfig`, `PGliteWithSupapower` |
 | `supapower/changes`    | `ChangeRow`, `UnrecoverableUploadError`, `SyncTransaction`                             |
 | `supapower/errors`     | `SupapowerError`, `SupapowerUploadError`, `asSupapowerError`, the guards and codes     |
+| `supapower/events`     | `SupapowerEventTarget`, `SupapowerErrorEvent`, `SupapowerTableEvent`                   |
 | `supapower/leadership` | `createLeadership` and the individual strategies                                       |
 
 `createSupapower(pg)` is the same code path as the extension, for when registering an extension is

@@ -1,5 +1,5 @@
-import { resolveTables, type SyncedTable, withLocalColumns } from '../sync.js';
-import type { SupapowerTableConfig } from '../types.js';
+import { resolveTables, withLocalColumns } from '../sync.js';
+import type { SupapowerSyncedTable, SupapowerTableConfig } from '../types.js';
 import { escapeIdentifier } from '../utils.js';
 
 /**
@@ -15,7 +15,7 @@ import { escapeIdentifier } from '../utils.js';
 export function resolveTablesWith(
   tables: Array<SupapowerTableConfig | string>,
   columns: Record<string, readonly string[]>,
-): Map<string, SyncedTable> {
+): Map<string, SupapowerSyncedTable> {
   const configs = resolveTables(tables);
 
   return withLocalColumns(

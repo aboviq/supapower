@@ -25,6 +25,12 @@ import {
   SupapowerUploadError,
 } from './errors.js';
 import {
+  createSupapowerEvents,
+  SupapowerErrorEvent,
+  SupapowerTableEvent,
+  type SupapowerEventTarget,
+} from './events.js';
+import {
   clearSyncedCursorAt,
   type CursorWatermark,
   getSyncedCursorAt,
@@ -32,7 +38,7 @@ import {
   setSyncedCursorAt,
   setSyncedUser,
 } from './metadata.js';
-import type { SupapowerTableConfig } from './types.js';
+import type { ResolvedTableConfig, SupapowerSyncedTable, SupapowerTableConfig } from './types.js';
 import { escapeIdentifier, executeInTransaction } from './utils.js';
 
 /** Safety net in case a notification is missed while leadership changes hands. */
@@ -52,33 +58,6 @@ const RETRY_MAX_MS = 60_000;
  * downloaded whole again.
  */
 const CURSOR_MARGIN_MS = 60_000;
-
-/** A table entry with every default filled in. */
-export interface ResolvedTableConfig extends SupapowerTableConfig {
-  /** The schema the table lives in remotely, in Supabase. */
-  schema: string;
-  /** The schema the table lives in locally, in PGlite. */
-  localSchema: string;
-  primaryKey: string;
-  access: 'anon' | 'authenticated';
-}
-
-/**
- * A resolved table, described against the local database.
- *
- * Only the parts of the sync that read `columns` ask for one; the rest make do
- * with a {@link ResolvedTableConfig}.
- */
-export interface SyncedTable extends ResolvedTableConfig {
-  /**
-   * The columns the table has in the local database, sorted.
-   *
-   * The application owns the local schema, and it lags behind the remote one
-   * whenever the server deploys first, so this is what an incoming row is
-   * trimmed to fit.
-   */
-  columns: readonly string[];
-}
 
 /**
  * Fills in everything a table entry left out.
@@ -139,8 +118,8 @@ export function resolveTables(
 export function withLocalColumns(
   configs: Map<string, ResolvedTableConfig>,
   columns: Map<string, readonly string[]>,
-): Map<string, SyncedTable> {
-  const described = new Map<string, SyncedTable>();
+): Map<string, SupapowerSyncedTable> {
+  const described = new Map<string, SupapowerSyncedTable>();
 
   for (const [name, config] of configs) {
     described.set(name, { ...config, columns: columns.get(name) ?? [] });
@@ -342,8 +321,8 @@ export interface OutgoingSyncOptions {
   signal: AbortSignal;
   /** Handles batches Supabase rejects for good. Defaults to discarding them. */
   onUnrecoverableError?: (context: UnrecoverableUploadError) => void | Promise<void>;
-  /** Called when a batch could not be pushed, before the retry is scheduled. */
-  onError?: (error: SupapowerError) => void;
+  /** Dispatched for `uploadStart`/`uploadFinish`/`error`. @default A fresh, unlistened `EventTarget`. */
+  events?: SupapowerEventTarget;
 }
 
 /**
@@ -359,9 +338,10 @@ export interface OutgoingSyncOptions {
  * changes wait rather than being pushed with an anonymous token and discarded
  * as a row-level security denial.
  *
- * An UPDATE or DELETE that matches no row is reported through `onError`, not
- * thrown. It looks the same as a batch re-sent after a crash, so the queue keeps
- * moving and the application decides whether it was a divergence.
+ * An UPDATE or DELETE that matches no row is reported through the `error`
+ * event, not thrown. It looks the same as a batch re-sent after a crash, so
+ * the queue keeps moving and the application decides whether it was a
+ * divergence.
  *
  * Failures are sorted into two kinds. Anything transient - offline, a 5xx, a
  * dropped connection - leaves the batch queued and is retried with an
@@ -374,13 +354,15 @@ export async function runOutgoingSync({
   tables,
   signal,
   onUnrecoverableError = discardUnrecoverable,
-  onError,
+  events = createSupapowerEvents(),
 }: OutgoingSyncOptions): Promise<void> {
   let attempt = 0;
 
   while (!signal.aborted) {
     try {
       for await (const { batch, commit } of getNextSyncTransaction(pg, tables, signal)) {
+        events.dispatchEvent(new Event('uploadStart'));
+
         let rejected: ChangeRow | undefined;
 
         try {
@@ -398,10 +380,12 @@ export async function runOutgoingSync({
               // Not thrown: a batch re-sent after a crash also matches nothing
               // the second time, and failing here would wedge the queue on a
               // change that can never succeed again.
-              onError?.(
-                new SupapowerError(
-                  `Supabase ignored a ${change.operation} on ${remoteName(config)}: no row matched. The row may be gone, or row-level security may be hiding it from this user.`,
-                  { code: change.operation === 'DELETE' ? 'delete_ignored' : 'update_ignored' },
+              events.dispatchEvent(
+                new SupapowerErrorEvent(
+                  new SupapowerError(
+                    `Supabase ignored a ${change.operation} on ${remoteName(config)}: no row matched. The row may be gone, or row-level security may be hiding it from this user.`,
+                    { code: change.operation === 'DELETE' ? 'delete_ignored' : 'update_ignored' },
+                  ),
                 ),
               );
             }
@@ -412,6 +396,7 @@ export async function runOutgoingSync({
           }
 
           await commit();
+          events.dispatchEvent(new Event('uploadFinish'));
         } catch (error) {
           if (signal.aborted) {
             return;
@@ -438,6 +423,8 @@ export async function runOutgoingSync({
             // to back off instead of spinning on a change that cannot succeed.
             throw error;
           }
+
+          events.dispatchEvent(new Event('uploadFinish'));
         }
       }
 
@@ -449,7 +436,11 @@ export async function runOutgoingSync({
         return;
       }
 
-      onError?.(asSupapowerError(error, 'The outgoing sync failed', 'upload_failed'));
+      events.dispatchEvent(
+        new SupapowerErrorEvent(
+          asSupapowerError(error, 'The outgoing sync failed', 'upload_failed'),
+        ),
+      );
 
       await backOff(signal, attempt);
 
@@ -484,7 +475,7 @@ export async function handleIncomingChange(
     localSchema,
     primaryKey,
     columns: local,
-  }: Pick<SyncedTable, 'table' | 'localSchema' | 'primaryKey' | 'columns'>,
+  }: Pick<SupapowerSyncedTable, 'table' | 'localSchema' | 'primaryKey' | 'columns'>,
 ): Promise<readonly string[]> {
   const columns: string[] = [];
   const parameters: unknown[] = [];
@@ -647,7 +638,7 @@ function selectable(column: string): string {
  */
 function stillApplies(
   watermark: CursorWatermark | null,
-  config: SyncedTable,
+  config: SupapowerSyncedTable,
 ): watermark is CursorWatermark {
   return (
     watermark !== null
@@ -659,11 +650,13 @@ function stillApplies(
 async function downloadTable(
   pg: PGliteInterface,
   supabase: SupabaseClient,
-  config: SyncedTable,
+  config: SupapowerSyncedTable,
   signal: AbortSignal,
+  events: SupapowerEventTarget,
 ): Promise<void> {
   const { cursor, columns } = config;
   const name = localName(config);
+  events.dispatchEvent(new SupapowerTableEvent('downloadTableStart', config));
 
   // Taken before the request so a change made while it is in flight is dated
   // after the snapshot rather than swallowed by it.
@@ -694,7 +687,13 @@ async function downloadTable(
     );
   }
 
-  if (signal.aborted || data.length === 0) {
+  if (signal.aborted) {
+    return; // cut short by a leadership change; not a finish
+  }
+
+  if (data.length === 0) {
+    events.dispatchEvent(new SupapowerTableEvent('downloadTableFinish', config));
+
     return;
   }
 
@@ -734,14 +733,22 @@ async function downloadTable(
       await setSyncedCursorAt(tx, name, { at: highest, cursor, columns: [...columns] });
     }
   });
+
+  events.dispatchEvent(new SupapowerTableEvent('downloadTableFinish', config));
 }
 
 export interface InitialSyncOptions {
   pg: PGliteInterface;
   supabase: SupabaseClient;
   /** The tables to download, in the order they should be downloaded. */
-  tables: Map<string, SyncedTable>;
+  tables: Map<string, SupapowerSyncedTable>;
   signal: AbortSignal;
+  /**
+   * Dispatched for `downloadStart`/`downloadFinish`/`downloadTableStart`/`downloadTableFinish`.
+   *
+   * @default A fresh, unlistened `EventTarget`.
+   */
+  events?: SupapowerEventTarget;
 }
 
 /**
@@ -761,14 +768,19 @@ export async function runInitialSync({
   supabase,
   tables,
   signal,
+  events = createSupapowerEvents(),
 }: InitialSyncOptions): Promise<void> {
+  events.dispatchEvent(new Event('downloadStart'));
+
   for (const config of tables.values()) {
     if (signal.aborted) {
       return;
     }
 
-    await downloadTable(pg, supabase, config, signal);
+    await downloadTable(pg, supabase, config, signal, events);
   }
+
+  events.dispatchEvent(new Event('downloadFinish'));
 }
 
 export interface IncomingSyncOptions {
@@ -780,7 +792,7 @@ export interface IncomingSyncOptions {
    * Already filtered for the current user - deciding which tables are
    * reachable is the caller's job, see `access` in `SupapowerTableConfig`.
    */
-  tables: Map<string, SyncedTable>;
+  tables: Map<string, SupapowerSyncedTable>;
   /**
    * Aborted when leadership is lost, when the signed in user changes, or when
    * the sync is unsubscribed.
@@ -788,8 +800,11 @@ export interface IncomingSyncOptions {
   signal: AbortSignal;
   /** Overrides the generated channel name. */
   channel?: string;
-  /** Called when a change could not be applied, or the channel reports trouble. */
-  onError?: (error: SupapowerError) => void;
+  /**
+   * Dispatched for `error` and, on catch-up, the download events.
+   * @default A fresh, unlistened `EventTarget`.
+   */
+  events?: SupapowerEventTarget;
 }
 
 /**
@@ -820,7 +835,7 @@ export async function runIncomingSync({
   tables,
   signal,
   channel = `supapower:incoming:${crypto.randomUUID()}`,
-  onError,
+  events = createSupapowerEvents(),
 }: IncomingSyncOptions): Promise<void> {
   if (signal.aborted || tables.size === 0) {
     return; // nothing this user is allowed to see
@@ -845,7 +860,11 @@ export async function runIncomingSync({
         await task();
       } catch (error: unknown) {
         // Caught per task so one bad row cannot break the chain for the rest.
-        onError?.(asSupapowerError(error, 'Could not apply a remote change', 'apply_failed'));
+        events.dispatchEvent(
+          new SupapowerErrorEvent(
+            asSupapowerError(error, 'Could not apply a remote change', 'apply_failed'),
+          ),
+        );
       }
     })();
   };
@@ -865,17 +884,19 @@ export async function runIncomingSync({
       reported.add(`${table}.${escapeIdentifier(column)}`);
     }
 
-    onError?.(
-      new SupapowerError(
-        `Ignored ${fresh.map((column) => escapeIdentifier(column)).join(', ')} from a remote change to ${table}: this client's schema has no such column`,
-        { code: 'column_ignored' },
+    events.dispatchEvent(
+      new SupapowerErrorEvent(
+        new SupapowerError(
+          `Ignored ${fresh.map((column) => escapeIdentifier(column)).join(', ')} from a remote change to ${table}: this client's schema has no such column`,
+          { code: 'column_ignored' },
+        ),
       ),
     );
   };
 
   const apply = (
     payload: RealtimePostgresChangesPayload<Record<string, unknown>>,
-    config: SyncedTable,
+    config: SupapowerSyncedTable,
   ) =>
     enqueue(async () => {
       reportIgnored(remoteName(config), await handleIncomingChange(pg, payload, config));
@@ -891,12 +912,16 @@ export async function runIncomingSync({
     );
   }
 
-  const download = () => enqueue(() => runInitialSync({ pg, supabase, tables, signal }));
+  const download = () => enqueue(() => runInitialSync({ pg, supabase, tables, signal, events }));
 
   // Whether the channel has dropped since the last download. realtime-js
   // rejoins on its own but replays nothing, so anything that changed while it
   // was away has to be fetched rather than waited for.
   let missedChanges = false;
+
+  // Tracked so `connect`/`disconnect` only fire on an actual transition, not
+  // on every reported hiccup while already down.
+  let connected = false;
 
   const closed = new Promise<void>((resolve) => {
     signal.addEventListener('abort', () => resolve(), { once: true });
@@ -907,6 +932,9 @@ export async function runIncomingSync({
       }
 
       if (status === REALTIME_SUBSCRIBE_STATES.SUBSCRIBED) {
+        connected = true;
+        events.dispatchEvent(new Event('connect'));
+
         if (missedChanges) {
           missedChanges = false;
           download();
@@ -920,11 +948,18 @@ export async function runIncomingSync({
       // fight it. The catch-up happens when it comes back.
       missedChanges = true;
 
-      onError?.(
-        asSupapowerError(
-          error,
-          `Realtime channel "${channel}" reported ${status}`,
-          'connection_failed',
+      if (connected) {
+        connected = false;
+        events.dispatchEvent(new Event('disconnect'));
+      }
+
+      events.dispatchEvent(
+        new SupapowerErrorEvent(
+          asSupapowerError(
+            error,
+            `Realtime channel "${channel}" reported ${status}`,
+            'connection_failed',
+          ),
         ),
       );
     });
@@ -938,6 +973,10 @@ export async function runIncomingSync({
   try {
     await closed;
   } finally {
+    if (connected) {
+      events.dispatchEvent(new Event('disconnect'));
+    }
+
     await Promise.all([supabase.removeChannel(subscription), applying]);
   }
 }

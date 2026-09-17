@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 
 import type { UnrecoverableUploadError } from './changes.js';
 import { isUnrecoverableUploadError, type SupapowerError } from './errors.js';
+import { createSupapowerEvents } from './events.js';
 import { runOutgoingSync } from './sync.js';
 import { waitFor } from './tests/async.js';
 import { createChange } from './tests/changes.js';
@@ -41,6 +42,58 @@ describe('runOutgoingSync', () => {
     expect(supabase.calls).toEqual(['upsert:todos', 'upsert:todos']);
   });
 
+  test('dispatches uploadStart before and uploadFinish after a committed batch', async () => {
+    const pg = createFakePGlite({ changes: [createChange('100', 1), createChange('100', 2)] });
+    const supabase = createFakeSupabase();
+    const controller = new AbortController();
+    const events = createSupapowerEvents();
+    const seen: string[] = [];
+
+    events.addEventListener('uploadStart', () => seen.push('uploadStart'));
+    events.addEventListener('uploadFinish', () => seen.push('uploadFinish'));
+
+    const running = runOutgoingSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: controller.signal,
+      events,
+    });
+
+    expect(await waitFor(() => pg.queue.length === 0)).toBe(true);
+    controller.abort();
+    await running;
+
+    // Both changes share a `tx_id`, so they are one batch: one pair of events.
+    expect(seen).toEqual(['uploadStart', 'uploadFinish']);
+  });
+
+  test('does not dispatch uploadFinish for a batch that stays queued after a transient failure', async () => {
+    const pg = createFakePGlite({ changes: [createChange('100', 1)] });
+    const supabase = createFakeSupabase({ respond: () => ({ code: '08006', message: 'offline' }) });
+    const controller = new AbortController();
+    const events = createSupapowerEvents();
+    const errors: SupapowerError[] = [];
+    const finishes: Event[] = [];
+
+    events.addEventListener('error', (event) => errors.push(event.error));
+    events.addEventListener('uploadFinish', (event) => finishes.push(event));
+
+    const running = runOutgoingSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: controller.signal,
+      events,
+    });
+
+    expect(await waitFor(() => errors.length > 0)).toBe(true);
+    controller.abort();
+    await running;
+
+    expect(finishes).toEqual([]);
+  });
+
   test('discards a batch Supabase will never accept, by default', async () => {
     const pg = createFakePGlite({ changes: [createChange('100', 1), createChange('100', 2)] });
     const supabase = createFakeSupabase({
@@ -48,13 +101,16 @@ describe('runOutgoingSync', () => {
     });
     const controller = new AbortController();
     const errors: SupapowerError[] = [];
+    const events = createSupapowerEvents();
+
+    events.addEventListener('error', (event) => errors.push(event.error));
 
     const running = runOutgoingSync({
       pg: asPGlite(pg),
       supabase: asSupabaseClient(supabase),
       tables,
       signal: controller.signal,
-      onError: (error) => errors.push(error),
+      events,
     });
 
     expect(await waitFor(() => pg.queue.length === 0)).toBe(true);
@@ -72,13 +128,16 @@ describe('runOutgoingSync', () => {
     const supabase = createFakeSupabase({ respond: () => ({ code: '08006', message: 'offline' }) });
     const controller = new AbortController();
     const errors: SupapowerError[] = [];
+    const events = createSupapowerEvents();
+
+    events.addEventListener('error', (event) => errors.push(event.error));
 
     const running = runOutgoingSync({
       pg: asPGlite(pg),
       supabase: asSupabaseClient(supabase),
       tables,
       signal: controller.signal,
-      onError: (error) => errors.push(error),
+      events,
     });
 
     expect(await waitFor(() => errors.length > 0)).toBe(true);
@@ -127,7 +186,10 @@ describe('runOutgoingSync', () => {
     });
     const controller = new AbortController();
     const errors: SupapowerError[] = [];
+    const events = createSupapowerEvents();
     let handled = 0;
+
+    events.addEventListener('error', (event) => errors.push(event.error));
 
     const running = runOutgoingSync({
       pg: asPGlite(pg),
@@ -137,7 +199,7 @@ describe('runOutgoingSync', () => {
       onUnrecoverableError: () => {
         handled += 1; // deliberately does not commit
       },
-      onError: (error) => errors.push(error),
+      events,
     });
 
     expect(await waitFor(() => errors.length > 0)).toBe(true);
@@ -159,13 +221,16 @@ describe('runOutgoingSync - a DELETE that matched nothing', () => {
     const supabase = createFakeSupabase({ deletedRows: () => 0 });
     const controller = new AbortController();
     const errors: SupapowerError[] = [];
+    const events = createSupapowerEvents();
+
+    events.addEventListener('error', (event) => errors.push(event.error));
 
     const running = runOutgoingSync({
       pg: asPGlite(pg),
       supabase: asSupabaseClient(supabase),
       tables,
       signal: controller.signal,
-      onError: (error) => errors.push(error),
+      events,
     });
 
     expect(await waitFor(() => pg.queue.length === 0)).toBe(true);
@@ -182,13 +247,16 @@ describe('runOutgoingSync - a DELETE that matched nothing', () => {
     const supabase = createFakeSupabase();
     const controller = new AbortController();
     const errors: SupapowerError[] = [];
+    const events = createSupapowerEvents();
+
+    events.addEventListener('error', (event) => errors.push(event.error));
 
     const running = runOutgoingSync({
       pg: asPGlite(pg),
       supabase: asSupabaseClient(supabase),
       tables,
       signal: controller.signal,
-      onError: (error) => errors.push(error),
+      events,
     });
 
     expect(await waitFor(() => pg.queue.length === 0)).toBe(true);
@@ -203,13 +271,16 @@ describe('runOutgoingSync - a DELETE that matched nothing', () => {
     const supabase = createFakeSupabase({ deletedRows: () => null });
     const controller = new AbortController();
     const errors: SupapowerError[] = [];
+    const events = createSupapowerEvents();
+
+    events.addEventListener('error', (event) => errors.push(event.error));
 
     const running = runOutgoingSync({
       pg: asPGlite(pg),
       supabase: asSupabaseClient(supabase),
       tables,
       signal: controller.signal,
-      onError: (error) => errors.push(error),
+      events,
     });
 
     expect(await waitFor(() => pg.queue.length === 0)).toBe(true);
@@ -301,13 +372,16 @@ describe('runOutgoingSync - what an update sends', () => {
     const supabase = createFakeSupabase({ updatedRows: () => 0 });
     const errors: SupapowerError[] = [];
     const controller = new AbortController();
+    const events = createSupapowerEvents();
+
+    events.addEventListener('error', (event) => errors.push(event.error));
 
     const running = runOutgoingSync({
       pg: asPGlite(pg),
       supabase: asSupabaseClient(supabase),
       tables,
       signal: controller.signal,
-      onError: (error) => errors.push(error),
+      events,
     });
 
     expect(await waitFor(() => pg.queue.length === 0)).toBe(true);

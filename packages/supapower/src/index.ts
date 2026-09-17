@@ -2,7 +2,7 @@ import type { PGliteInterface } from '@electric-sql/pglite';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import type { UnrecoverableUploadError } from './changes.js';
-import type { SupapowerError } from './errors.js';
+import { createSupapowerEvents, type SupapowerEventTarget } from './events.js';
 import { createLeadership } from './leadership.js';
 import { readLocalColumns, runMigrations, trackTables } from './migrations.js';
 import {
@@ -10,10 +10,14 @@ import {
   resolveTables,
   runIncomingSync,
   runOutgoingSync,
-  type SyncedTable,
   withLocalColumns,
 } from './sync.js';
-import type { SupapowerNamespace, SupapowerSync, SupapowerSyncOptions } from './types.js';
+import type {
+  SupapowerNamespace,
+  SupapowerSync,
+  SupapowerSyncOptions,
+  SupapowerSyncedTable,
+} from './types.js';
 
 /** Stands in for a client whose token the application owns. */
 const EXTERNAL_AUTH = Symbol('external-auth');
@@ -54,18 +58,18 @@ function watchAuthIdentity(
 interface SyncSupervisorOptions {
   pg: PGliteInterface;
   supabase: SupabaseClient;
-  tables: Map<string, SyncedTable>;
+  tables: Map<string, SupapowerSyncedTable>;
   /** Aborted when leadership is lost or the sync is unsubscribed. */
   signal: AbortSignal;
+  events: SupapowerEventTarget;
   onUnrecoverableError?: (context: UnrecoverableUploadError) => void | Promise<void>;
-  onError?: (error: SupapowerError) => void;
 }
 
 /** The tables that are reachable for a given identity. */
 function reachableTables(
-  tables: Map<string, SyncedTable>,
+  tables: Map<string, SupapowerSyncedTable>,
   identity: AuthIdentity,
-): Map<string, SyncedTable> {
+): Map<string, SupapowerSyncedTable> {
   if (identity !== null) {
     return tables;
   }
@@ -97,8 +101,8 @@ function superviseSync({
   supabase,
   tables,
   signal,
+  events,
   onUnrecoverableError,
-  onError,
 }: SyncSupervisorOptions): void {
   let identity: AuthIdentity | undefined;
   let running: AbortController | undefined;
@@ -131,8 +135,8 @@ function superviseSync({
         supabase,
         tables: reachable,
         signal: session,
+        events,
         ...(onUnrecoverableError ? { onUnrecoverableError } : {}),
-        ...(onError ? { onError } : {}),
       });
 
       await runIncomingSync({
@@ -140,7 +144,7 @@ function superviseSync({
         supabase,
         tables: reachable,
         signal: session,
-        ...(onError ? { onError } : {}),
+        events,
       });
     })();
   };
@@ -178,18 +182,20 @@ export interface SupapowerExtension {
  * `pg.supapower.sync(...)`.
  */
 export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
+  const events = createSupapowerEvents();
+
   return {
+    events,
     async sync({
       supabase,
       tables,
       signal,
       scope = 'default',
       onUnrecoverableError,
-      onError,
     }: SupapowerSyncOptions): Promise<SupapowerSync> {
       const leadership = createLeadership(pg, scope);
 
-      let configs = new Map<string, SyncedTable>();
+      let configs = new Map<string, SupapowerSyncedTable>();
       let stopLeadership: (() => void) | undefined;
       let stopped = false;
 
@@ -243,8 +249,8 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
           supabase,
           tables: configs,
           signal: leaderSignal,
+          events,
           ...(onUnrecoverableError ? { onUnrecoverableError } : {}),
-          ...(onError ? { onError } : {}),
         });
       });
 
