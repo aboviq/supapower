@@ -52,7 +52,10 @@ export const supabase = createClient('https://xyzcompany.supabase.co', 'your-pub
 
 ### 2. Set up PGlite
 
-Follow [PGlite's Multi-tab Worker setup instructions](https://pglite.dev/docs/multi-tab-worker) and use the IndexedDB VFS which is recommended at the moment.
+> [!TIP]
+> Not in a browser environment? Skip to the next step and use Supapower directly with `PGlite.create`, e.g. in a Node.js, Bun or Deno environment.
+
+In a browser environment, follow [PGlite's Multi-tab Worker setup instructions](https://pglite.dev/docs/multi-tab-worker) and use the IndexedDB VFS which is recommended at the moment.
 
 This will give you two more files: `pglite-worker.ts` and `pglite.ts`:
 
@@ -93,6 +96,8 @@ export const pg = await PGliteWorker.create(
 
 Modify your PGlite client configuration to enable the Supapower extension:
 
+#### In a browser environment
+
 ```diff
 // ./pglite.ts
 import { PGliteWorker } from '@electric-sql/pglite/worker';
@@ -108,6 +113,21 @@ export const pg = await PGliteWorker.create(
 +   },
 + },
 );
+```
+
+#### In a non-browser environment (Node.js, Bun, Deno)
+
+```ts
+// ./pglite.ts
+import { PGlite, NodeFS } from '@electric-sql/pglite';
+import { supapower } from 'supapower';
+
+export const pg = await PGlite.create({
+  fs: new NodeFS('./path/to/datadir/'),
+  extensions: {
+    supapower,
+  },
+});
 ```
 
 ### 4. Start the synchronization with Supabase
