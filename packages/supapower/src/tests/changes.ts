@@ -1,7 +1,7 @@
 import type { ChangeRow } from '../changes.js';
 
 /**
- * Builds a queued change, defaulting to an INSERT on `todos`.
+ * Builds a queued change, defaulting to an INSERT on `public.todos`.
  *
  * Changes sharing a `txId` form one batch, the same way the change trigger
  * groups them by `tx_id`.
@@ -14,6 +14,7 @@ export function createChange(
   return {
     id,
     tx_id: txId,
+    schema_name: 'public',
     table_name: 'todos',
     operation: 'INSERT',
     new_data: { id, title: 'write tests' },

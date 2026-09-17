@@ -39,7 +39,8 @@ export interface FakePGliteOptions {
   /** Rows to seed the outgoing queue with. */
   changes?: ChangeRow[];
   /**
-   * The columns each table has locally.
+   * The columns each table has locally, keyed by qualified name or by bare
+   * table name.
    *
    * A table left out has just `"id"`, which is what the primary key check
    * needs and what most fixtures use.
@@ -57,47 +58,79 @@ export function asPGlite(pg: FakePGlite): PGliteInterface {
   return pg as unknown as PGliteInterface;
 }
 
+/** What `raw` and `identifier` produce: a fragment, not a parameter. */
+function isTemplatePart(value: unknown): value is { str: string } {
+  // oxlint-disable-next-line no-underscore-dangle -- PGlite's own field name.
+  return typeof value === 'object' && value !== null && 'str' in value && '_templateType' in value;
+}
+
+/** Whether a queued change is for one of the reachable tables. */
+const within = (names: Set<string> | undefined) => (row: ChangeRow) =>
+  !names || names.has(`${row.schema_name}.${row.table_name}`);
+
 function createBase({ changes = [], columns }: FakePGliteOptions): FakePGlite {
   const statements: string[] = [];
   const queue = [...changes];
   const metadata = new Map<string, unknown>();
   const truncated: string[] = [];
 
-  const sql: FakeSql = (strings, ...values) => {
-    const text = strings.join('?').replaceAll(/\s+/g, ' ').trim();
+  const sql: FakeSql = (strings, ...args) => {
+    // `raw` and `identifier` template parts are substituted into the query
+    // rather than parameterized, the same as PGlite's own `sql` does - so a
+    // statement's schema is visible in `statements` instead of being a `?`.
+    const values: unknown[] = [];
+
+    let rendered = strings[0] ?? '';
+
+    for (const [index, value] of args.entries()) {
+      if (isTemplatePart(value)) {
+        rendered += value.str;
+      } else {
+        rendered += '?';
+        values.push(value);
+      }
+
+      rendered += strings[index + 1] ?? '';
+    }
+
+    const text = rendered.replaceAll(/\s+/g, ' ').trim();
 
     statements.push(text);
 
-    // `ANY(?::text[])` is the reachable-table filter the outgoing sync applies.
-    const reachable = (position: number) => {
-      const names = values[position];
+    // `(schema_name, table_name) IN unnest(?, ?)` is the reachable-table filter
+    // the outgoing sync applies, as two parallel arrays.
+    const reachable = (at: number) => {
+      const schemas = values[at];
+      const names = values[at + 1];
 
-      return Array.isArray(names) ? new Set(names as string[]) : undefined;
+      if (!Array.isArray(schemas) || !Array.isArray(names)) {
+        return undefined;
+      }
+
+      return new Set((names as string[]).map((table, index) => `${schemas[index]}.${table}`));
     };
 
     if (text.startsWith('SELECT tx_id')) {
-      const names = reachable(0);
-      const oldest = queue.find((row) => !names || names.has(row.table_name));
+      const oldest = queue.find(within(reachable(0)));
 
       return Promise.resolve({ rows: oldest ? [{ tx_id: oldest.tx_id }] : [] });
     }
 
     if (text.startsWith('SELECT * FROM supapower.changes')) {
-      const names = reachable(1);
+      const matches = within(reachable(1));
 
       return Promise.resolve({
-        rows: queue.filter(
-          (row) => row.tx_id === values[0] && (!names || names.has(row.table_name)),
-        ),
+        rows: queue.filter((row) => row.tx_id === values[0] && matches(row)),
       });
     }
 
     if (text.startsWith('DELETE FROM supapower.changes')) {
-      const names = reachable(1);
+      const reached = within(reachable(1));
 
-      const matches = text.includes('table_name = ?')
-        ? (row: ChangeRow) => row.table_name === values[0]
-        : (row: ChangeRow) => row.tx_id === values[0] && (!names || names.has(row.table_name));
+      // Either the whole batch, or everything a truncated table had queued.
+      const matches = text.includes('schema_name = ? AND table_name = ?')
+        ? (row: ChangeRow) => row.schema_name === values[0] && row.table_name === values[1]
+        : (row: ChangeRow) => row.tx_id === values[0] && reached(row);
 
       for (let index = queue.length - 1; index >= 0; index -= 1) {
         const row = queue[index];
@@ -108,15 +141,18 @@ function createBase({ changes = [], columns }: FakePGliteOptions): FakePGlite {
       }
     }
 
-    if (text.startsWith('SELECT table_name, column_name FROM information_schema.columns')) {
-      const wanted = (values[0] as string[]) ?? [];
+    if (text.startsWith('SELECT table_schema, table_name, column_name FROM information_schema')) {
+      const schemas = (values[0] as string[]) ?? [];
+      const names = (values[1] as string[]) ?? [];
 
       return Promise.resolve({
-        rows: wanted.flatMap((table) =>
-          (columns?.[table] ?? ['id'])
+        rows: names.flatMap((table, index) => {
+          const schema = schemas[index] ?? 'public';
+
+          return (columns?.[`${schema}.${table}`] ?? columns?.[table] ?? ['id'])
             .toSorted()
-            .map((column) => ({ table_name: table, column_name: column })),
-        ),
+            .map((column) => ({ table_schema: schema, table_name: table, column_name: column }));
+        }),
       });
     }
 

@@ -7,6 +7,15 @@ import { asPGlite, createFakePGlite } from './tests/pglite.js';
 const deletes = (statements: string[]) =>
   statements.filter((statement) => statement.startsWith('DELETE FROM supapower.changes'));
 
+/**
+ * The reachable-table filter, which names a local schema alongside every table.
+ *
+ * Keyed by table name rather than the qualified one the sync uses, since only
+ * the values are ever read.
+ */
+const reachable = (...tables: string[]) =>
+  new Map(tables.map((table) => [table, { localSchema: 'public', table }]));
+
 describe('getNextSyncTransaction', () => {
   test('yields every change sharing the oldest transaction id', async () => {
     const pg = createFakePGlite({
@@ -15,7 +24,7 @@ describe('getNextSyncTransaction', () => {
 
     const transactions = getNextSyncTransaction(
       asPGlite(pg),
-      ['todos'],
+      reachable('todos'),
       new AbortController().signal,
     );
     const { value } = await transactions.next();
@@ -30,7 +39,7 @@ describe('getNextSyncTransaction', () => {
 
     const transactions = getNextSyncTransaction(
       asPGlite(pg),
-      ['todos'],
+      reachable('todos'),
       new AbortController().signal,
     );
     const { value } = await transactions.next();
@@ -47,7 +56,7 @@ describe('getNextSyncTransaction', () => {
 
     const transactions = getNextSyncTransaction(
       asPGlite(pg),
-      ['todos'],
+      reachable('todos'),
       new AbortController().signal,
     );
     const { value } = await transactions.next();
@@ -66,7 +75,11 @@ describe('getNextSyncTransaction', () => {
   test('ends without querying once the signal is aborted', async () => {
     const pg = createFakePGlite({ changes: [createChange('100', 1)] });
 
-    const transactions = getNextSyncTransaction(asPGlite(pg), ['todos'], AbortSignal.abort());
+    const transactions = getNextSyncTransaction(
+      asPGlite(pg),
+      reachable('todos'),
+      AbortSignal.abort(),
+    );
 
     expect(await transactions.next()).toEqual({ done: true, value: undefined });
     expect(pg.statements).toEqual([]);
@@ -84,7 +97,7 @@ describe('getNextSyncTransaction - reachable tables', () => {
 
     const transactions = getNextSyncTransaction(
       asPGlite(pg),
-      ['plans'],
+      reachable('plans'),
       new AbortController().signal,
     );
     const { value } = await transactions.next();
@@ -104,7 +117,7 @@ describe('getNextSyncTransaction - reachable tables', () => {
 
     const transactions = getNextSyncTransaction(
       asPGlite(pg),
-      ['plans'],
+      reachable('plans'),
       new AbortController().signal,
     );
     const { value } = await transactions.next();
@@ -120,7 +133,11 @@ describe('getNextSyncTransaction - reachable tables', () => {
   test('ends immediately when nothing is reachable', async () => {
     const pg = createFakePGlite({ changes: [createChange('100', 1, { table_name: 'todos' })] });
 
-    const transactions = getNextSyncTransaction(asPGlite(pg), [], new AbortController().signal);
+    const transactions = getNextSyncTransaction(
+      asPGlite(pg),
+      new Map(),
+      new AbortController().signal,
+    );
 
     expect(await transactions.next()).toEqual({ done: true, value: undefined });
     expect(pg.queue).toHaveLength(1);

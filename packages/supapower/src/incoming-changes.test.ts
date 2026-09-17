@@ -71,7 +71,12 @@ const LOCAL: Record<string, string[]> = {
 };
 
 const apply = (payload: RealtimePostgresChangesPayload<Row>, primaryKey = 'id') =>
-  handleIncomingChange(pg, payload, { primaryKey, columns: LOCAL[payload.table] ?? [] });
+  handleIncomingChange(pg, payload, {
+    table: payload.table,
+    localSchema: payload.schema,
+    primaryKey,
+    columns: LOCAL[payload.table] ?? [],
+  });
 
 const rowsOf = async <T>(query: string) => (await pg.query<T>(query)).rows;
 
@@ -144,7 +149,9 @@ describe('handleIncomingChange', () => {
   });
 
   test('does not queue what it applied as an outgoing change', async () => {
-    await trackTables(pg, [{ table: 'todos', primaryKey: 'id', columns: ['done', 'id', 'title'] }]);
+    await trackTables(pg, [
+      { table: 'todos', localSchema: 'public', primaryKey: 'id', columns: ['done', 'id', 'title'] },
+    ]);
 
     await apply(insert('todos', { id: ONE, title: 'from the server', done: false }));
     await apply(update('todos', { id: ONE, title: 'edited remotely', done: true }, { id: ONE }));
@@ -155,7 +162,9 @@ describe('handleIncomingChange', () => {
   });
 
   test('leaves a local write alone, so tracking still works either side of it', async () => {
-    await trackTables(pg, [{ table: 'todos', primaryKey: 'id', columns: ['done', 'id', 'title'] }]);
+    await trackTables(pg, [
+      { table: 'todos', localSchema: 'public', primaryKey: 'id', columns: ['done', 'id', 'title'] },
+    ]);
 
     await apply(insert('todos', { id: ONE, title: 'from the server', done: false }));
     await pg.exec(`INSERT INTO todos VALUES ('${TWO}', 'mine', false);`);
@@ -240,5 +249,68 @@ describe('handleIncomingChange - an update for a row that is not here', () => {
     expect(await rowsOf('SELECT id, title FROM todos')).toEqual([
       { id: ONE, title: 'edited remotely' },
     ]);
+  });
+});
+
+describe('handleIncomingChange - a local schema of its own', () => {
+  beforeEach(async () => {
+    await pg.exec(`
+      CREATE SCHEMA app;
+      CREATE TABLE app.todos (id uuid PRIMARY KEY, title text, done boolean);
+    `);
+  });
+
+  const into = (payload: RealtimePostgresChangesPayload<Row>) =>
+    handleIncomingChange(pg, payload, {
+      table: 'todos',
+      localSchema: 'app',
+      primaryKey: 'id',
+      columns: LOCAL['todos'] ?? [],
+    });
+
+  test('writes a remote row into the local schema, not the one it came from', async () => {
+    await into(insert('todos', { id: ONE, title: 'from another device', done: false }));
+
+    expect(await rowsOf('SELECT title FROM app.todos')).toEqual([{ title: 'from another device' }]);
+    expect(await rowsOf('SELECT title FROM public.todos')).toEqual([]);
+  });
+
+  test('deletes from the local schema too', async () => {
+    await pg.exec(`
+      INSERT INTO app.todos VALUES ('${ONE}', 'gone', false);
+      INSERT INTO public.todos VALUES ('${ONE}', 'stays', false);
+    `);
+
+    await into(remove('todos', { id: ONE }));
+
+    expect(await rowsOf('SELECT title FROM app.todos')).toEqual([]);
+    expect(await rowsOf('SELECT title FROM public.todos')).toEqual([{ title: 'stays' }]);
+  });
+
+  test('checks the queue for the local schema, so a same-named table is no guard', async () => {
+    await pg.exec(`
+      INSERT INTO app.todos VALUES ('${ONE}', 'theirs', false);
+
+      INSERT INTO supapower.changes (schema_name, table_name, tx_id, operation, new_data)
+      VALUES ('public', 'todos', pg_current_xact_id(), 'UPDATE', '{"id":"${ONE}"}'::jsonb);
+    `);
+
+    await into(update('todos', { id: ONE, title: 'edited remotely', done: true }, { id: ONE }));
+
+    // The queued change belongs to public.todos, which is a different table.
+    expect(await rowsOf('SELECT title FROM app.todos')).toEqual([{ title: 'edited remotely' }]);
+  });
+
+  test('still holds off when the queued change is for this table', async () => {
+    await pg.exec(`
+      INSERT INTO app.todos VALUES ('${ONE}', 'mine', false);
+
+      INSERT INTO supapower.changes (schema_name, table_name, tx_id, operation, new_data)
+      VALUES ('app', 'todos', pg_current_xact_id(), 'UPDATE', '{"id":"${ONE}"}'::jsonb);
+    `);
+
+    await into(update('todos', { id: ONE, title: 'theirs', done: true }, { id: ONE }));
+
+    expect(await rowsOf('SELECT title FROM app.todos')).toEqual([{ title: 'mine' }]);
   });
 });

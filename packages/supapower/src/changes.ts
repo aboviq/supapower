@@ -15,6 +15,7 @@ import { once } from './utils.js';
 export interface InsertChange {
   id: number;
   tx_id: string;
+  schema_name: string;
   table_name: string;
   operation: 'INSERT';
   new_data: Record<string, unknown>;
@@ -25,6 +26,7 @@ export interface InsertChange {
 export interface UpdateChange {
   id: number;
   tx_id: string;
+  schema_name: string;
   table_name: string;
   operation: 'UPDATE';
   new_data: Record<string, unknown>;
@@ -35,6 +37,7 @@ export interface UpdateChange {
 export interface DeleteChange {
   id: number;
   tx_id: string;
+  schema_name: string;
   table_name: string;
   operation: 'DELETE';
   new_data: null;
@@ -106,17 +109,33 @@ export interface UnrecoverableUploadError {
  *
  * Callers must hold leadership for as long as they iterate - see
  * `./leadership.ts` for why that cannot be a lock inside Postgres.
+ *
+ * @param tables The tables whose changes may be drained, as the resolved
+ *   configuration keyed them. Only the values are read.
  */
 export async function* getNextSyncTransaction(
   pg: PGliteInterface,
-  tables: string[],
+  tables: Map<string, { localSchema: string; table: string }>,
   signal: AbortSignal,
 ): AsyncGenerator<SyncTransaction, undefined, void> {
+  // A change records the schema its trigger fired in, so the filter has to
+  // match on both halves - two same-named tables in different schemas are not
+  // the same table, and may well be reachable at different times.
+  const schemas: string[] = [];
+  const names: string[] = [];
+
+  for (const { localSchema, table } of tables.values()) {
+    schemas.push(localSchema);
+    names.push(table);
+  }
+
   while (!signal.aborted) {
     // Get the oldest unsynced change's transaction ID
     const oldest = await pg.sql<{ tx_id: string }>`
       SELECT tx_id FROM supapower.changes
-      WHERE table_name = ANY(${tables}::text[])
+      WHERE (schema_name, table_name) IN (
+        SELECT * FROM unnest(${schemas}::text[], ${names}::text[])
+      )
       ORDER BY id ASC LIMIT 1
     `;
 
@@ -134,7 +153,9 @@ export async function* getNextSyncTransaction(
     const batch = await pg.sql<ChangeRow>`
       SELECT * FROM supapower.changes
       WHERE tx_id = ${row.tx_id}
-        AND table_name = ANY(${tables}::text[])
+        AND (schema_name, table_name) IN (
+          SELECT * FROM unnest(${schemas}::text[], ${names}::text[])
+        )
       ORDER BY id ASC
     `;
 
@@ -154,7 +175,9 @@ export async function* getNextSyncTransaction(
       await pg.sql`
         DELETE FROM supapower.changes
         WHERE tx_id = ${row.tx_id}
-          AND table_name = ANY(${tables}::text[])
+          AND (schema_name, table_name) IN (
+            SELECT * FROM unnest(${schemas}::text[], ${names}::text[])
+          )
       `;
     });
 

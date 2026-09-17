@@ -14,6 +14,31 @@ export interface SupapowerTableConfig {
   table: string;
 
   /**
+   * Schema the table lives in remotely, in Supabase.
+   *
+   * It has to be exposed in the project's Data API settings, and its tables
+   * added to the realtime publication, the same as `public`.
+   *
+   * Unless {@link localSchema} says otherwise, the local table is expected in
+   * this schema too.
+   *
+   * @default "public"
+   */
+  schema?: string;
+
+  /**
+   * Schema the table lives in locally, in PGlite, when that is not the schema
+   * it lives in remotely.
+   *
+   * Use it to keep synced tables apart from the rest of the local database, or
+   * to flatten several remote schemas into one local one. The remote side is
+   * unaffected and stays on {@link schema}.
+   *
+   * @default The table's remote {@link schema}
+   */
+  localSchema?: string;
+
+  /**
    * Primary key column name
    *
    * All synced tables should have a single column primary key.

@@ -60,6 +60,8 @@ export interface CursorWatermark {
  *
  * The value comes straight out of the remote table, so it is only ever
  * comparable to itself - see {@link CursorWatermark}.
+ *
+ * @param table The table's qualified local name, e.g. `public.todos`.
  */
 export const getSyncedCursorAt = async (
   pg: PGliteInterface | Transaction,
@@ -72,7 +74,11 @@ export const getSyncedCursorAt = async (
   return rows[0]?.value?.[table] ?? null;
 };
 
-/** Records how far a table has been downloaded, and under what. */
+/**
+ * Records how far a table has been downloaded, and under what.
+ *
+ * @param table The table's qualified local name, e.g. `public.todos`.
+ */
 export const setSyncedCursorAt = async (
   pg: PGliteInterface | Transaction,
   table: string,
@@ -92,7 +98,11 @@ export const setSyncedCursorAt = async (
   `;
 };
 
-/** Forgets how far tables were downloaded, so the next start pulls them whole. */
+/**
+ * Forgets how far tables were downloaded, so the next start pulls them whole.
+ *
+ * @param tables The tables' qualified local names, e.g. `public.todos`.
+ */
 export const clearSyncedCursorAt = async (
   pg: PGliteInterface | Transaction,
   tables: string[],

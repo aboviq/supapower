@@ -6,7 +6,7 @@ import { runOutgoingSync } from './sync.js';
 import { waitFor } from './tests/async.js';
 import { createChange } from './tests/changes.js';
 import { asPGlite, createFakePGlite } from './tests/pglite.js';
-import { asSupabaseClient, createFakeSupabase } from './tests/supabase.js';
+import { asSupabaseClient, createFakeSupabase, type FakeSupabase } from './tests/supabase.js';
 import { resolveTablesWith } from './tests/tables.js';
 
 const edit = (before: Record<string, unknown>, after: Record<string, unknown>) =>
@@ -326,5 +326,81 @@ describe('runOutgoingSync - what an update sends', () => {
 
     expect(supabase.calls).toEqual(['upsert:todos']);
     expect(supabase.payloads[0]).toEqual({ id: 1, title: 'write tests' });
+  });
+});
+
+describe('runOutgoingSync - tables outside "public"', () => {
+  const tables = resolveTablesWith(
+    [
+      { table: 'todos', schema: 'app' },
+      { table: 'notes', schema: 'app', localSchema: 'mirror' },
+    ],
+    { 'app.todos': ['id', 'title'], 'mirror.notes': ['id', 'title'] },
+  );
+
+  const drain = async (pg: ReturnType<typeof createFakePGlite>, supabase: FakeSupabase) => {
+    const controller = new AbortController();
+
+    const running = runOutgoingSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: controller.signal,
+    });
+
+    expect(await waitFor(() => pg.queue.length === 0)).toBe(true);
+    controller.abort();
+    await running;
+  };
+
+  test('pushes a change to the schema the table was configured for', async () => {
+    const pg = createFakePGlite({
+      changes: [createChange('100', 1, { schema_name: 'app', table_name: 'todos' })],
+    });
+    const supabase = createFakeSupabase();
+
+    await drain(pg, supabase);
+
+    expect(supabase.calls).toEqual(['upsert:todos']);
+    expect(supabase.schemas).toEqual(['app']);
+  });
+
+  test('pushes a change made in the local schema to the remote one', async () => {
+    const pg = createFakePGlite({
+      changes: [createChange('100', 1, { schema_name: 'mirror', table_name: 'notes' })],
+    });
+    const supabase = createFakeSupabase();
+
+    await drain(pg, supabase);
+
+    // Queued as "mirror.notes" locally, and it belongs in "app" upstream.
+    expect(supabase.calls).toEqual(['upsert:notes']);
+    expect(supabase.schemas).toEqual(['app']);
+  });
+
+  test('leaves a same-named table in another schema queued', async () => {
+    const pg = createFakePGlite({
+      changes: [
+        createChange('100', 1, { schema_name: 'public', table_name: 'todos' }),
+        createChange('101', 2, { schema_name: 'app', table_name: 'todos' }),
+      ],
+    });
+    const supabase = createFakeSupabase();
+    const controller = new AbortController();
+
+    const running = runOutgoingSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: controller.signal,
+    });
+
+    expect(await waitFor(() => pg.queue.length === 1)).toBe(true);
+    controller.abort();
+    await running;
+
+    // "public.todos" is not configured, so it is a different table entirely.
+    expect(supabase.calls).toEqual(['upsert:todos']);
+    expect(pg.queue.map((change) => change.schema_name)).toEqual(['public']);
   });
 });

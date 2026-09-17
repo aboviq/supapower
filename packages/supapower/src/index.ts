@@ -7,11 +7,11 @@ import { createLeadership } from './leadership.js';
 import { readLocalColumns, runMigrations, trackTables } from './migrations.js';
 import {
   reconcileUser,
-  type ResolvedTableConfig,
   resolveTables,
   runIncomingSync,
   runOutgoingSync,
-  tableNames,
+  type SyncedTable,
+  withLocalColumns,
 } from './sync.js';
 import type { SupapowerNamespace, SupapowerSync, SupapowerSyncOptions } from './types.js';
 
@@ -54,7 +54,7 @@ function watchAuthIdentity(
 interface SyncSupervisorOptions {
   pg: PGliteInterface;
   supabase: SupabaseClient;
-  tables: Map<string, ResolvedTableConfig>;
+  tables: Map<string, SyncedTable>;
   /** Aborted when leadership is lost or the sync is unsubscribed. */
   signal: AbortSignal;
   onUnrecoverableError?: (context: UnrecoverableUploadError) => void | Promise<void>;
@@ -63,9 +63,9 @@ interface SyncSupervisorOptions {
 
 /** The tables that are reachable for a given identity. */
 function reachableTables(
-  tables: Map<string, ResolvedTableConfig>,
+  tables: Map<string, SyncedTable>,
   identity: AuthIdentity,
-): Map<string, ResolvedTableConfig> {
+): Map<string, SyncedTable> {
   if (identity !== null) {
     return tables;
   }
@@ -189,7 +189,7 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
     }: SupapowerSyncOptions): Promise<SupapowerSync> {
       const leadership = createLeadership(pg, scope);
 
-      let configs = new Map<string, ResolvedTableConfig>();
+      let configs = new Map<string, SyncedTable>();
       let stopLeadership: (() => void) | undefined;
       let stopped = false;
 
@@ -221,9 +221,13 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
       await pg.waitReady;
       await runMigrations(pg);
 
-      // Read after the migrations, so a table the application creates in the
-      // same startup is already there to be described.
-      configs = resolveTables(tables, await readLocalColumns(pg, tableNames(tables)));
+      const resolved = resolveTables(tables);
+
+      // Described after the migrations, so a table the application creates in
+      // the same startup is already there to be read.
+      const columns = await readLocalColumns(pg, resolved);
+
+      configs = withLocalColumns(resolved, columns);
 
       await trackTables(pg, [...configs.values()]);
 

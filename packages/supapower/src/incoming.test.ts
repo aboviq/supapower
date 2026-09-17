@@ -286,3 +286,55 @@ describe('runIncomingSync - catching up after a dropped channel', () => {
     await running;
   });
 });
+
+describe('runIncomingSync - tables outside "public"', () => {
+  const configured = resolveTablesWith(
+    [
+      { table: 'todos', schema: 'app' },
+      { table: 'notes', schema: 'app', localSchema: 'mirror' },
+    ],
+    { 'app.todos': ['id', 'title'], 'mirror.notes': ['id', 'title'] },
+  );
+
+  test('binds the channel to the remote schema', async () => {
+    const supabase = createFakeSupabase();
+    const controller = new AbortController();
+
+    const running = runIncomingSync({
+      pg: asPGlite(createFakePGlite()),
+      supabase: asSupabaseClient(supabase),
+      tables: configured,
+      signal: controller.signal,
+    });
+
+    // Both are "app" upstream; where they land locally is nothing realtime
+    // knows about.
+    expect(supabase.openChannel?.bindings).toEqual(['app.todos', 'app.notes']);
+
+    controller.abort();
+    await running;
+  });
+
+  test('applies a change to the local schema the table was mapped to', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase();
+    const controller = new AbortController();
+
+    const running = runIncomingSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables: configured,
+      signal: controller.signal,
+    });
+
+    supabase.openChannel?.emit({
+      ...insert('notes', { id: 1, title: 'from another device' }),
+      schema: 'app',
+    });
+
+    expect(await waitFor(() => ran(pg, 'INSERT INTO "mirror"."notes"'))).toBe(true);
+
+    controller.abort();
+    await running;
+  });
+});

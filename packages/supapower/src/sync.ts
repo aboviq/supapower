@@ -53,13 +53,23 @@ const RETRY_MAX_MS = 60_000;
  */
 const CURSOR_MARGIN_MS = 60_000;
 
-/** A table config with the defaults filled in and the local schema attached. */
-export interface ResolvedTableConfig {
-  table: string;
+/** A table entry with every default filled in. */
+export interface ResolvedTableConfig extends SupapowerTableConfig {
+  /** The schema the table lives in remotely, in Supabase. */
+  schema: string;
+  /** The schema the table lives in locally, in PGlite. */
+  localSchema: string;
   primaryKey: string;
   access: 'anon' | 'authenticated';
-  /** Timestamp column an incremental download filters on, when there is one. */
-  cursor?: string;
+}
+
+/**
+ * A resolved table, described against the local database.
+ *
+ * Only the parts of the sync that read `columns` ask for one; the rest make do
+ * with a {@link ResolvedTableConfig}.
+ */
+export interface SyncedTable extends ResolvedTableConfig {
   /**
    * The columns the table has in the local database, sorted.
    *
@@ -70,52 +80,100 @@ export interface ResolvedTableConfig {
   columns: readonly string[];
 }
 
-/** The table names in a configuration, in the order they were given. */
-export function tableNames(tables: Array<SupapowerTableConfig | string>): string[] {
-  return tables.map((entry) => (typeof entry === 'string' ? entry : entry.table));
+/**
+ * Fills in everything a table entry left out.
+ *
+ * The local schema follows the remote one unless it is given, so configuring
+ * neither puts the table in `public` at both ends.
+ */
+function asConfig(entry: SupapowerTableConfig | string): ResolvedTableConfig {
+  const config = typeof entry === 'string' ? { table: entry } : entry;
+  const schema = config.schema ?? 'public';
+
+  return {
+    ...config,
+    schema,
+    localSchema: config.localSchema ?? schema,
+    primaryKey: config.primaryKey ?? 'id',
+    access: config.access ?? 'authenticated',
+  };
 }
 
 /**
- * Fills in the defaults for a table entry and keys them by table name.
+ * Where a table is queued, named, and keyed: locally.
+ */
+const localName = ({ localSchema, table }: ResolvedTableConfig): string =>
+  escapeIdentifier(localSchema, table);
+
+/**
+ * What the table is called upstream, for anything Supabase was asked about.
+ */
+const remoteName = ({ schema, table }: ResolvedTableConfig): string =>
+  escapeIdentifier(schema, table);
+
+/**
+ * Fills in the defaults for each table entry and keys them by {@link localName}.
  *
- * @param columns The local columns per table, from `readLocalColumns`.
+ * Keyed on the local side because that is the side everything else has in
+ * hand: a queued change records the schema its trigger fired in, and two
+ * remote schemas flattened into one local one are one local table.
  */
 export function resolveTables(
   tables: Array<SupapowerTableConfig | string>,
-  columns: Map<string, readonly string[]>,
 ): Map<string, ResolvedTableConfig> {
   return new Map(
     tables.map((entry) => {
-      const config = typeof entry === 'string' ? { table: entry } : entry;
+      const config = asConfig(entry);
 
-      return [
-        config.table,
-        {
-          table: config.table,
-          primaryKey: config.primaryKey ?? 'id',
-          access: config.access ?? 'authenticated',
-          columns: columns.get(config.table) ?? [],
-          ...(config.cursor ? { cursor: config.cursor } : {}),
-        },
-      ];
+      return [localName(config), config];
     }),
   );
+}
+
+/**
+ * Describes each resolved table against the local database.
+ *
+ * @param columns The local columns per table, from `readLocalColumns`, keyed
+ *   the same way the configs are.
+ */
+export function withLocalColumns(
+  configs: Map<string, ResolvedTableConfig>,
+  columns: Map<string, readonly string[]>,
+): Map<string, SyncedTable> {
+  const described = new Map<string, SyncedTable>();
+
+  for (const [name, config] of configs) {
+    described.set(name, { ...config, columns: columns.get(name) ?? [] });
+  }
+
+  return described;
 }
 
 function tableFor(
   change: ChangeRow,
   tables: Map<string, ResolvedTableConfig>,
 ): ResolvedTableConfig {
-  const config = tables.get(change.table_name);
+  const name = escapeIdentifier(change.schema_name, change.table_name);
+  const config = tables.get(name);
 
   if (!config) {
     throw new SupapowerError(
-      `Local changes are queued for "${change.table_name}", which is not configured for syncing`,
+      `Local changes are queued for ${name}, which is not configured for syncing`,
       { code: 'schema_mismatch' },
     );
   }
 
   return config;
+}
+
+/**
+ * The remote table, in whichever schema it was configured for.
+ *
+ * Always through `schema()`, even for `public`: the client's own default
+ * schema is the application's setting, and a table's schema is Supapower's.
+ */
+function remote(supabase: SupabaseClient, { schema, table }: ResolvedTableConfig) {
+  return supabase.schema(schema).from(table);
 }
 
 /**
@@ -146,7 +204,7 @@ function uploadFailed(
   error: PostgrestError,
 ): SupapowerUploadError {
   return new SupapowerUploadError(
-    `Could not push a ${operation} on "${table}" to Supabase: ${error.message}`,
+    `Could not push a ${operation} on ${table} to Supabase: ${error.message}`,
     { cause: error },
   );
 }
@@ -165,18 +223,19 @@ function uploadFailed(
  */
 async function pushChange(
   supabase: SupabaseClient,
-  tables: Map<string, ResolvedTableConfig>,
+  config: ResolvedTableConfig,
   change: ChangeRow,
 ): Promise<boolean> {
-  const { table, primaryKey } = tableFor(change, tables);
+  const { primaryKey } = config;
+  const name = remoteName(config);
 
   if (change.operation === 'INSERT') {
-    const { error } = await supabase
-      .from(table)
-      .upsert(change.new_data, { onConflict: primaryKey });
+    const { error } = await remote(supabase, config).upsert(change.new_data, {
+      onConflict: primaryKey,
+    });
 
     if (error) {
-      throw uploadFailed(change.operation, table, error);
+      throw uploadFailed(change.operation, name, error);
     }
 
     return true;
@@ -186,13 +245,12 @@ async function pushChange(
   // forbidden row out of the `USING` clause rather than raising, so without the
   // count a denied write is indistinguishable from a successful one.
   if (change.operation === 'DELETE') {
-    const { error, count } = await supabase
-      .from(table)
+    const { error, count } = await remote(supabase, config)
       .delete({ count: 'exact' })
       .eq(primaryKey, change.old_data[primaryKey]);
 
     if (error) {
-      throw uploadFailed(change.operation, table, error);
+      throw uploadFailed(change.operation, name, error);
     }
 
     // `null` means the server did not report a count; only a definite zero is
@@ -206,13 +264,12 @@ async function pushChange(
     return true; // an update that moved nothing, which upstream already agrees with
   }
 
-  const { error, count } = await supabase
-    .from(table)
+  const { error, count } = await remote(supabase, config)
     .update(changed, { count: 'exact' })
     .eq(primaryKey, change.old_data[primaryKey]);
 
   if (error) {
-    throw uploadFailed(change.operation, table, error);
+    throw uploadFailed(change.operation, name, error);
   }
 
   return count !== 0;
@@ -319,13 +376,11 @@ export async function runOutgoingSync({
   onUnrecoverableError = discardUnrecoverable,
   onError,
 }: OutgoingSyncOptions): Promise<void> {
-  const reachable = [...tables.keys()];
-
   let attempt = 0;
 
   while (!signal.aborted) {
     try {
-      for await (const { batch, commit } of getNextSyncTransaction(pg, reachable, signal)) {
+      for await (const { batch, commit } of getNextSyncTransaction(pg, tables, signal)) {
         let rejected: ChangeRow | undefined;
 
         try {
@@ -336,7 +391,8 @@ export async function runOutgoingSync({
 
             rejected = change;
 
-            const applied = await pushChange(supabase, tables, change);
+            const config = tableFor(change, tables);
+            const applied = await pushChange(supabase, config, change);
 
             if (!applied) {
               // Not thrown: a batch re-sent after a crash also matches nothing
@@ -344,7 +400,7 @@ export async function runOutgoingSync({
               // change that can never succeed again.
               onError?.(
                 new SupapowerError(
-                  `Supabase ignored a ${change.operation} on "${change.table_name}": no row matched. The row may be gone, or row-level security may be hiding it from this user.`,
+                  `Supabase ignored a ${change.operation} on ${remoteName(config)}: no row matched. The row may be gone, or row-level security may be hiding it from this user.`,
                   { code: change.operation === 'DELETE' ? 'delete_ignored' : 'update_ignored' },
                 ),
               );
@@ -414,14 +470,21 @@ export async function runOutgoingSync({
  * See "Conflicts" in the readme for why the local version wins, and what that
  * costs.
  *
+ * The row goes where the configuration says it lives locally, not where the
+ * payload says it came from - the two differ whenever `localSchema` is set.
+ *
  * @param pg The PGlite interface or transaction to execute the change within.
  * @param payload The payload describing the incoming change from Supabase.
- * @param primaryKey The primary key column of the table being changed.
  */
 export async function handleIncomingChange(
   pg: PGliteInterface | Transaction,
   payload: RealtimePostgresChangesPayload<Record<string, unknown>>,
-  { primaryKey, columns: local }: Pick<ResolvedTableConfig, 'primaryKey' | 'columns'>,
+  {
+    table,
+    localSchema,
+    primaryKey,
+    columns: local,
+  }: Pick<SyncedTable, 'table' | 'localSchema' | 'primaryKey' | 'columns'>,
 ): Promise<readonly string[]> {
   const columns: string[] = [];
   const parameters: unknown[] = [];
@@ -453,20 +516,25 @@ export async function handleIncomingChange(
   // upload sends the whole row, that queued change is about to overwrite this
   // one upstream anyway - dropping it here just means local and remote agree
   // now rather than after the round trip.
-  parameters.push(payload.table, primaryKey, String(rowId));
+  //
+  // `push` returns the new length, so this is where the four of them start.
+  const guard = parameters.push(localSchema, table, primaryKey, String(rowId)) - 3;
 
   const unchanged = `
     NOT EXISTS (
       SELECT 1 FROM supapower.changes
-      WHERE table_name = $${parameters.length - 2}
-        AND COALESCE(new_data, old_data) ->> $${parameters.length - 1} = $${parameters.length}
+      WHERE schema_name = $${guard}
+        AND table_name = $${guard + 1}
+        AND COALESCE(new_data, old_data) ->> $${guard + 2} = $${guard + 3}
     )`;
 
-  const table = escapeIdentifier(payload.schema, payload.table);
+  // Where the row goes locally, which is not where it came from when the two
+  // schemas differ.
+  const relation = escapeIdentifier(localSchema, table);
 
   const query = removing
     ? `
-      DELETE FROM ${table}
+      DELETE FROM ${relation}
       WHERE ${escapeIdentifier(primaryKey)} = $1
         AND ${unchanged}
     `
@@ -475,7 +543,7 @@ export async function handleIncomingChange(
       // row was never inserted locally - a missed insert would otherwise leave
       // an UPDATE matching nothing at all.
       `
-      INSERT INTO ${table} (
+      INSERT INTO ${relation} (
         ${columns.map((column) => escapeIdentifier(column)).join(',\n        ')}
       )
       SELECT
@@ -519,37 +587,43 @@ export async function reconcileUser(
     return false;
   }
 
-  const owned = [...tables.values()].filter((config) => config.access === 'authenticated');
+  return pg.transaction(async (tx) => {
+    const toClearCursorFor: string[] = [];
 
-  await pg.transaction(async (tx) => {
-    for (const { table } of owned) {
+    for (const [key, { table, localSchema, access }] of tables) {
+      if (access !== 'authenticated') {
+        continue;
+      }
+
+      toClearCursorFor.push(key);
+
       // TRUNCATE only fires TRUNCATE triggers, so this does not queue itself up
       // as a pile of outgoing deletes.
-      await tx.query(`TRUNCATE TABLE ${escapeIdentifier('public', table)}`);
+      await tx.query(`TRUNCATE TABLE ${key}`);
 
-      await tx.sql`DELETE FROM supapower.changes WHERE table_name = ${table}`;
+      await tx.sql`
+        DELETE FROM supapower.changes
+        WHERE schema_name = ${localSchema} AND table_name = ${table}
+      `;
     }
 
-    await clearSyncedCursorAt(
-      tx,
-      owned.map(({ table }) => table),
-    );
+    await clearSyncedCursorAt(tx, toClearCursorFor);
 
     await setSyncedUser(tx, user);
-  });
 
-  return owned.length > 0;
+    return toClearCursorFor.length > 0;
+  });
 }
 
 /** Dresses a downloaded row up as the INSERT event it would have been. */
 function asInsertEvent(
-  table: string,
+  { schema, table }: ResolvedTableConfig,
   row: Record<string, unknown>,
   snapshotAt: string,
 ): RealtimePostgresInsertPayload<Record<string, unknown>> {
   return {
     eventType: 'INSERT',
-    schema: 'public',
+    schema,
     table,
     commit_timestamp: snapshotAt,
     new: row,
@@ -560,7 +634,7 @@ function asInsertEvent(
 
 /** Quotes a column for a PostgREST `select`, which only needs it sometimes. */
 function selectable(column: string): string {
-  return /^[a-z_][\w$]*$/i.test(column) ? column : `"${column.replaceAll('"', '""')}"`;
+  return /^[a-z_][\w$]*$/i.test(column) ? column : escapeIdentifier(column);
 }
 
 /**
@@ -573,7 +647,7 @@ function selectable(column: string): string {
  */
 function stillApplies(
   watermark: CursorWatermark | null,
-  config: ResolvedTableConfig,
+  config: SyncedTable,
 ): watermark is CursorWatermark {
   return (
     watermark !== null
@@ -585,16 +659,17 @@ function stillApplies(
 async function downloadTable(
   pg: PGliteInterface,
   supabase: SupabaseClient,
-  config: ResolvedTableConfig,
+  config: SyncedTable,
   signal: AbortSignal,
 ): Promise<void> {
-  const { table, cursor, columns } = config;
+  const { cursor, columns } = config;
+  const name = localName(config);
 
   // Taken before the request so a change made while it is in flight is dated
   // after the snapshot rather than swallowed by it.
   const snapshotAt = new Date().toISOString();
 
-  const stored = cursor ? await getSyncedCursorAt(pg, table) : null;
+  const stored = cursor ? await getSyncedCursorAt(pg, name) : null;
   const since = stillApplies(stored, config) ? Date.parse(stored.at) : Number.NaN;
 
   // Where an incremental download starts: {@link CURSOR_MARGIN_MS} further back
@@ -604,16 +679,19 @@ async function downloadTable(
 
   // Asking for the columns this client has keeps a column it does not know
   // about out of the download entirely, rather than trimming it off on arrival.
-  const select = supabase.from(table).select(columns.map(selectable).join(','));
+  const select = remote(supabase, config).select(columns.map(selectable).join(','));
   const query = cursor && from ? select.gte(cursor, from) : select;
 
-  const { data, error } = await query.returns<Array<Record<string, unknown>>>();
+  const { data, error } = await query.overrideTypes<
+    Array<Record<string, unknown>>,
+    { merge: false }
+  >();
 
   if (error) {
-    throw new SupapowerError(`Could not download "${table}" from Supabase: ${error.message}`, {
-      code: 'download_failed',
-      cause: error,
-    });
+    throw new SupapowerError(
+      `Could not download ${remoteName(config)} from Supabase: ${error.message}`,
+      { code: 'download_failed', cause: error },
+    );
   }
 
   if (signal.aborted || data.length === 0) {
@@ -632,7 +710,7 @@ async function downloadTable(
     let highestAt = Number.isNaN(since) ? Number.NEGATIVE_INFINITY : since;
 
     for (const row of data) {
-      await handleIncomingChange(tx, asInsertEvent(table, row, snapshotAt), config);
+      await handleIncomingChange(tx, asInsertEvent(config, row, snapshotAt), config);
 
       if (cursor === undefined) {
         continue;
@@ -653,7 +731,7 @@ async function downloadTable(
     }
 
     if (highest !== null && cursor !== undefined) {
-      await setSyncedCursorAt(tx, table, { at: highest, cursor, columns: [...columns] });
+      await setSyncedCursorAt(tx, name, { at: highest, cursor, columns: [...columns] });
     }
   });
 }
@@ -662,7 +740,7 @@ export interface InitialSyncOptions {
   pg: PGliteInterface;
   supabase: SupabaseClient;
   /** The tables to download, in the order they should be downloaded. */
-  tables: Map<string, ResolvedTableConfig>;
+  tables: Map<string, SyncedTable>;
   signal: AbortSignal;
 }
 
@@ -702,7 +780,7 @@ export interface IncomingSyncOptions {
    * Already filtered for the current user - deciding which tables are
    * reachable is the caller's job, see `access` in `SupapowerTableConfig`.
    */
-  tables: Map<string, ResolvedTableConfig>;
+  tables: Map<string, SyncedTable>;
   /**
    * Aborted when leadership is lost, when the signed in user changes, or when
    * the sync is unsubscribed.
@@ -777,19 +855,19 @@ export async function runIncomingSync({
   const reported = new Set<string>();
 
   const reportIgnored = (table: string, ignored: readonly string[]) => {
-    const fresh = ignored.filter((column) => !reported.has(`${table}.${column}`));
+    const fresh = ignored.filter((column) => !reported.has(`${table}.${escapeIdentifier(column)}`));
 
     if (fresh.length === 0) {
       return;
     }
 
     for (const column of fresh) {
-      reported.add(`${table}.${column}`);
+      reported.add(`${table}.${escapeIdentifier(column)}`);
     }
 
     onError?.(
       new SupapowerError(
-        `Ignored ${fresh.map((column) => `"${column}"`).join(', ')} from a remote change to "${table}": this client's schema has no such column`,
+        `Ignored ${fresh.map((column) => escapeIdentifier(column)).join(', ')} from a remote change to ${table}: this client's schema has no such column`,
         { code: 'column_ignored' },
       ),
     );
@@ -797,10 +875,10 @@ export async function runIncomingSync({
 
   const apply = (
     payload: RealtimePostgresChangesPayload<Record<string, unknown>>,
-    config: ResolvedTableConfig,
+    config: SyncedTable,
   ) =>
     enqueue(async () => {
-      reportIgnored(config.table, await handleIncomingChange(pg, payload, config));
+      reportIgnored(remoteName(config), await handleIncomingChange(pg, payload, config));
     });
 
   let subscription = supabase.channel(channel);
@@ -808,7 +886,7 @@ export async function runIncomingSync({
   for (const config of tables.values()) {
     subscription = subscription.on(
       'postgres_changes',
-      { event: '*', schema: 'public', table: config.table },
+      { event: '*', schema: config.schema, table: config.table },
       (payload: RealtimePostgresChangesPayload<Record<string, unknown>>) => apply(payload, config),
     );
   }

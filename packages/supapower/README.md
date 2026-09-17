@@ -277,6 +277,18 @@ interface SupapowerSync {
 interface SupapowerTableConfig {
   table: string;
   /**
+   * Schema the table lives in remotely, in Supabase.
+   *
+   * @default "public"
+   */
+  schema?: string;
+  /**
+   * Schema the table lives in locally, in PGlite, when that differs.
+   *
+   * @default The table's remote `schema`
+   */
+  localSchema?: string;
+  /**
    * @default "id"
    */
   primaryKey?: string;
@@ -315,6 +327,31 @@ Three things to know about it:
 - **A row that becomes visible without changing is invisible to it.** An incremental download asks for rows whose timestamp moved. Being added to a shared project does not move any timestamp on the project's rows - they were there all along, you just could not see them - so they are never fetched. Realtime does not help either: it only delivers rows that actually change. See the [schema recommendations](#schema-recommendations) below for what to do about it.
 - **A full download will still happen in some cases:** the `cursor` is changed to another column, or the the local tracked table's schema changed, or the table [depends on the current user](#table-access-configuration) and it changed.
 
+###### Table `schema` configuration
+
+Everything defaults to `public` on both sides, and a table that stays there needs neither option.
+
+`schema` moves a table to another schema in Supabase. Expose it in the project's [Data API settings](https://supabase.com/docs/guides/api/using-custom-schemas) and add its tables to the realtime publication, the same as you would for `public` - the Data API and Realtime both go to the schema named here, not to the client's own default:
+
+```ts
+{ table: 'todos', schema: 'app' }
+```
+
+That also expects `app.todos` locally. `localSchema` splits the two apart:
+
+```ts
+{ table: 'notes', schema: 'app', localSchema: 'mirror' }
+```
+
+Now `app.notes` in Supabase is kept in sync with `mirror.notes` in PGlite. Use it to keep synced tables out of the local `public` schema, or to flatten several remote schemas into one local one. Only the local side moves; the Data API request and the realtime binding still say `app`.
+
+A few things follow from a table being identified by both halves:
+
+- **A table is keyed by where it lives locally.** `public.todos` and `app.todos` are two different tables, tracked separately, with separate download watermarks - and a local change to one is never pushed as the other.
+- **The change triggers record the schema they fired in**, so the outgoing queue only drains changes belonging to a configured table. Anything else waits, untouched.
+- **Truncation on a user change follows `localSchema`.** The local table is emptied and its queued changes dropped, a same-named table in another schema is left alone.
+- **Watermarks are keyed by the local name.** Moving a table between schemas means its next start downloads it whole.
+
 ###### Table `access` configuration
 
 The `access` configuration for a table controls what happens when a user signs in or out from Supabase (via the [`supabase.auth` API](https://supabase.com/docs/guides/auth)).
@@ -343,6 +380,8 @@ await pg.supapower.sync({
     { table: 'tags', primaryKey: 'tag_id' }, // tracks table "tags" with primary key "tag_id"
     { table: 'notes', cursor: 'updated_at' }, // only downloads what changed since last time
     { table: 'plans', access: 'anon' }, // tracks table "plans" and it will be synced even when a user hasn't signed in
+    { table: 'docs', schema: 'app' }, // syncs "app.docs" in Supabase with "app.docs" locally
+    { table: 'notes', schema: 'app', localSchema: 'mirror' }, // syncs "app.notes" in Supabase with "mirror.notes" locally
   ],
 });
 ```

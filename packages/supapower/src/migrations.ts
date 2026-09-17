@@ -3,10 +3,14 @@ import { identifier, raw } from '@electric-sql/pglite/template';
 
 import { CHANGES_CHANNEL } from './constants.js';
 import { SupapowerError } from './errors.js';
+import type { ResolvedTableConfig } from './sync.js';
+import { escapeIdentifier } from './utils.js';
 
 /** The part of a table's configuration the triggers need. */
 export interface TrackedTable {
   table: string;
+  /** The schema the table lives in locally - the only side triggers exist on. */
+  localSchema: string;
   primaryKey: string;
   /** The columns the table actually has locally, from {@link readLocalColumns}. */
   columns: readonly string[];
@@ -19,27 +23,45 @@ export interface TrackedTable {
  * the remote one whenever the server deploys first. Knowing what is there is
  * what lets an incoming row be trimmed to fit instead of failing to apply.
  *
- * @returns The columns per table, sorted, so two readings compare directly.
+ * Only the local side of a table is of any interest here, so a config's
+ * `schema` is ignored in favor of its `localSchema`.
+ *
+ * @param tables The resolved configuration, as `resolveTables` keyed it.
+ * @returns The columns per table, keyed by {@link escapeIdentifier} and
+ *   sorted, so two readings compare directly.
  */
 export const readLocalColumns = async (
   pg: PGliteInterface,
-  tableNames: string[],
+  tables: Map<string, ResolvedTableConfig>,
 ): Promise<Map<string, string[]>> => {
-  const columns = new Map<string, string[]>(tableNames.map((table) => [table, []]));
+  const columns = new Map<string, string[]>();
+  const schemas: string[] = [];
+  const names: string[] = [];
 
-  if (tableNames.length === 0) {
+  for (const [key, { localSchema, table }] of tables) {
+    columns.set(key, []);
+    schemas.push(localSchema);
+    names.push(table);
+  }
+
+  if (names.length === 0) {
     return columns;
   }
 
-  const { rows } = await pg.sql<{ table_name: string; column_name: string }>`
-    SELECT table_name, column_name FROM information_schema.columns
-    WHERE table_schema = 'public'
-      AND table_name = ANY(${tableNames}::text[])
-    ORDER BY table_name, column_name
+  const { rows } = await pg.sql<{
+    table_schema: string;
+    table_name: string;
+    column_name: string;
+  }>`
+    SELECT table_schema, table_name, column_name FROM information_schema.columns
+    WHERE (table_schema, table_name) IN (
+      SELECT * FROM unnest(${schemas}::text[], ${names}::text[])
+    )
+    ORDER BY table_schema, table_name, column_name
   `;
 
-  for (const { table_name, column_name } of rows) {
-    columns.get(table_name)?.push(column_name);
+  for (const { table_schema, table_name, column_name } of rows) {
+    columns.get(escapeIdentifier(table_schema, table_name))?.push(column_name);
   }
 
   return columns;
@@ -167,10 +189,10 @@ export const runMigrations = async (pg: PGliteInterface): Promise<void> => {
  * false, so every `UPDATE` would go unrecorded without a single error to say
  * so - which is far worse than refusing to start.
  */
-const assertPrimaryKey = ({ table, primaryKey, columns }: TrackedTable) => {
+const assertPrimaryKey = ({ table, localSchema, primaryKey, columns }: TrackedTable) => {
   if (!columns.includes(primaryKey)) {
     throw new SupapowerError(
-      `Table "${table}" has no column "${primaryKey}" to use as its primary key`,
+      `Table ${escapeIdentifier(localSchema, table)} has no column "${primaryKey}" to use as its primary key`,
       { code: 'schema_mismatch' },
     );
   }
@@ -182,7 +204,7 @@ export const trackTables = async (
 ): Promise<void> => {
   await Promise.all(
     tables.map(async (tracked) => {
-      const { table, primaryKey } = tracked;
+      const { table, localSchema, primaryKey } = tracked;
 
       assertPrimaryKey(tracked);
 
@@ -190,24 +212,28 @@ export const trackTables = async (
       // hand. `assertPrimaryKey` has already established it is a real column.
       const key = raw`'${primaryKey.replaceAll("'", "''")}'`;
 
+      // Two quoted parts rather than one identifier: `identifier` escapes what
+      // it is given as a single name, so "app.todos" would come out as one.
+      const relation = raw`${escapeIdentifier(localSchema, table)}`;
+
       await pg.transaction(async (tx) => {
         await tx.sql`
           CREATE OR REPLACE TRIGGER ${identifier`supapower_change_trigger_insert_${table}`}
-          AFTER INSERT ON ${identifier`${table}`}
+          AFTER INSERT ON ${relation}
           REFERENCING NEW TABLE AS new_table
           FOR EACH STATEMENT EXECUTE FUNCTION supapower.track_table_changes(${key});
         `;
 
         await tx.sql`
           CREATE OR REPLACE TRIGGER ${identifier`supapower_change_trigger_update_${table}`}
-          AFTER UPDATE ON ${identifier`${table}`}
+          AFTER UPDATE ON ${relation}
           REFERENCING OLD TABLE AS old_table NEW TABLE AS new_table
           FOR EACH STATEMENT EXECUTE FUNCTION supapower.track_table_changes(${key});
         `;
 
         await tx.sql`
           CREATE OR REPLACE TRIGGER ${identifier`supapower_change_trigger_delete_${table}`}
-          AFTER DELETE ON ${identifier`${table}`}
+          AFTER DELETE ON ${relation}
           REFERENCING OLD TABLE AS old_table
           FOR EACH STATEMENT EXECUTE FUNCTION supapower.track_table_changes(${key});
         `;

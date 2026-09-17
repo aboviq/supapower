@@ -68,7 +68,7 @@ describe('runInitialSync', () => {
       signal: live(),
     });
 
-    expect(failing).rejects.toThrow('Could not download "todos" from Supabase');
+    expect(failing).rejects.toThrow('Could not download "public"."todos" from Supabase');
   });
 
   test('stops downloading once the signal aborts', async () => {
@@ -132,14 +132,14 @@ describe('reconcileUser', () => {
     await reconcileUser(asPGlite(pg), tables, 'user-a');
 
     pg.metadata.set('SyncedCursorAt', {
-      todos: { at: '2026-01-01T00:00:00.000Z', cursor: 'updated_at', columns: ['id'] },
-      plans: { at: 'x', cursor: 'updated_at', columns: ['id'] },
+      '"public"."todos"': { at: '2026-01-01T00:00:00.000Z', cursor: 'updated_at', columns: ['id'] },
+      '"public"."plans"': { at: 'x', cursor: 'updated_at', columns: ['id'] },
     });
 
     await reconcileUser(asPGlite(pg), tables, null);
 
     // "plans" is anon, so it is neither emptied nor forgotten.
-    expect(Object.keys(pg.metadata.get('SyncedCursorAt') as object)).toEqual(['plans']);
+    expect(Object.keys(pg.metadata.get('SyncedCursorAt') as object)).toEqual(['"public"."plans"']);
   });
 
   test('treats a database that was never synced as nothing to clear', async () => {
@@ -191,7 +191,7 @@ describe('runInitialSync - incremental with a cursor', () => {
 
     expect(supabase.calls).toEqual(['select:todos', 'select:plans']);
     expect(pg.metadata.get('SyncedCursorAt')).toEqual({
-      todos: {
+      '"public"."todos"': {
         at: '2026-01-01T12:00:00.000Z',
         cursor: 'updated_at',
         columns: ['id', 'updated_at'],
@@ -275,7 +275,7 @@ describe('runInitialSync - incremental with a cursor', () => {
     });
 
     expect(pg.metadata.get('SyncedCursorAt')).toMatchObject({
-      todos: { at: '2026-01-01T12:00:00.000Z' },
+      '"public"."todos"': { at: '2026-01-01T12:00:00.000Z' },
     });
   });
 
@@ -416,5 +416,90 @@ describe('runInitialSync - schema drift', () => {
     // The stored value came out of a different column; comparing the new one
     // against it would quietly fetch the wrong set.
     expect(supabase.calls).toEqual(['select:todos', 'select:todos']);
+  });
+});
+
+describe('runInitialSync - tables outside "public"', () => {
+  const configured = resolveTablesWith(
+    [
+      { table: 'todos', schema: 'app' },
+      { table: 'notes', schema: 'app', localSchema: 'mirror' },
+    ],
+    { 'app.todos': ['id', 'title'], 'mirror.notes': ['id', 'title'] },
+  );
+
+  test('downloads from the schema each table was configured for', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase();
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables: configured,
+      signal: live(),
+    });
+
+    expect(supabase.calls).toEqual(['select:todos', 'select:notes']);
+    expect(supabase.schemas).toEqual(['app', 'app']);
+  });
+
+  test('writes the rows into the local schema', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase({
+      rows: { todos: [{ id: 1, title: 'one' }], notes: [{ id: 2, title: 'two' }] },
+    });
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables: configured,
+      signal: live(),
+    });
+
+    const inserts = pg.statements.filter((statement) => statement.startsWith('INSERT INTO'));
+
+    expect(inserts[0]).toContain('INSERT INTO "app"."todos"');
+    // Downloaded from "app" upstream, but it lives in "mirror" here.
+    expect(inserts[1]).toContain('INSERT INTO "mirror"."notes"');
+  });
+
+  test('keys the watermark by where the table lives locally', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase({
+      rows: { notes: [{ id: 1, updated_at: '2026-01-01T12:00:00.000Z' }] },
+    });
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables: resolveTablesWith(
+        [{ table: 'notes', schema: 'app', localSchema: 'mirror', cursor: 'updated_at' }],
+        { 'mirror.notes': ['id', 'updated_at'] },
+      ),
+      signal: live(),
+    });
+
+    expect(Object.keys(pg.metadata.get('SyncedCursorAt') as object)).toEqual(['"mirror"."notes"']);
+  });
+});
+
+describe('reconcileUser - tables outside "public"', () => {
+  const configured = resolveTablesWith([{ table: 'notes', schema: 'app', localSchema: 'mirror' }], {
+    'mirror.notes': ['id'],
+  });
+
+  test('truncates the local schema and drops only its queued changes', async () => {
+    const pg = createFakePGlite({
+      changes: [
+        createChange('100', 1, { schema_name: 'mirror', table_name: 'notes' }),
+        createChange('101', 2, { schema_name: 'public', table_name: 'notes' }),
+      ],
+    });
+
+    await reconcileUser(asPGlite(pg), configured, 'user-a');
+
+    expect(pg.statements).toContain('TRUNCATE TABLE "mirror"."notes"');
+    // The same-named table in "public" is not configured, so it is untouched.
+    expect(pg.queue.map((change) => change.schema_name)).toEqual(['public']);
   });
 });

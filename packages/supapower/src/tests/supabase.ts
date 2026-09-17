@@ -32,15 +32,33 @@ export interface FakeRealtimeChannel {
     callback: (payload: ChangePayload) => void,
   ): FakeRealtimeChannel;
   subscribe(callback?: (status: SubscribeStatus, error?: Error) => void): FakeRealtimeChannel;
-  /** Delivers a change to the binding for `table`, as the server would. */
+  /** Delivers a change to the binding for the payload's schema and table. */
   emit(payload: ChangePayload): void;
   /** Reports a subscribe status back to whoever called `subscribe`. */
   report(status: SubscribeStatus, error?: Error): void;
 }
 
+/** The per-table API a `schema()` hands out. */
+export interface FakeTable {
+  upsert(row: Record<string, unknown>): Promise<{
+    error: ResponseError | null;
+    count: number | null;
+  }>;
+  update(
+    row: Record<string, unknown>,
+    options?: { count?: string },
+  ): { eq(): Promise<{ error: ResponseError | null; count: number | null }> };
+  delete(options?: { count?: string }): {
+    eq(): Promise<{ error: ResponseError | null; count: number | null }>;
+  };
+  select(columns?: string): FakeSelect;
+}
+
 export interface FakeSupabase {
   /** Every write issued, as `"<operation>:<table>"`, in order. */
   readonly calls: string[];
+  /** The schema each call in `calls` went to, in the same order. */
+  readonly schemas: string[];
   /** The payload of every write, in the same order as the `calls` that carry one. */
   readonly payloads: Array<Record<string, unknown>>;
   /** Every `select` issued, as `"<table>:<columns>"`, in order. */
@@ -49,20 +67,8 @@ export interface FakeSupabase {
   readonly channels: FakeRealtimeChannel[];
   /** The channel that is currently open, if any. */
   readonly openChannel: FakeRealtimeChannel | undefined;
-  from(table: string): {
-    upsert(row: Record<string, unknown>): Promise<{
-      error: ResponseError | null;
-      count: number | null;
-    }>;
-    update(
-      row: Record<string, unknown>,
-      options?: { count?: string },
-    ): { eq(): Promise<{ error: ResponseError | null; count: number | null }> };
-    delete(options?: { count?: string }): {
-      eq(): Promise<{ error: ResponseError | null; count: number | null }>;
-    };
-    select(columns?: string): FakeSelect;
-  };
+  /** The only way in: Supapower names a table's schema on every request. */
+  schema(name: string): { from(table: string): FakeTable };
   channel(name: string): FakeRealtimeChannel;
   removeChannel(channel: FakeRealtimeChannel): Promise<'ok'>;
   auth: { onAuthStateChange(callback: AuthCallback): AuthSubscription };
@@ -81,7 +87,7 @@ interface SelectResult {
 export interface FakeSelect extends PromiseLike<SelectResult> {
   gte(column: string, value: string): FakeSelect;
   /** Type-level on the real builder; here it just keeps the chain going. */
-  returns<_T>(): FakeSelect;
+  overrideTypes<_T, _Options = { merge: true }>(): FakeSelect;
 }
 
 type AuthCallback = (event: string, session: { user: { id: string } } | null) => void;
@@ -124,10 +130,12 @@ const ignoreStatus = (_status: SubscribeStatus, _error?: Error): void => {};
  * `select()` still shows up in `calls`.
  */
 function createSelect(
+  schema: string,
   table: string,
   rows: Array<Record<string, unknown>>,
   downloadError: (table: string) => ResponseError | null,
   calls: string[],
+  schemas: string[],
   requested: string,
   requestedColumns: string[],
 ): FakeSelect {
@@ -141,7 +149,7 @@ function createSelect(
 
       return select;
     },
-    returns() {
+    overrideTypes() {
       return select;
     },
     // PostgREST's query builder is itself thenable, which is what this stands in for.
@@ -153,6 +161,7 @@ function createSelect(
       const filtered = column === undefined ? '' : `:gte(${column})`;
 
       calls.push(`select:${table}${filtered}`);
+      schemas.push(schema);
       requestedColumns.push(`${table}:${requested}`);
 
       const error = downloadError(table);
@@ -185,7 +194,7 @@ function createChannel(name: string): FakeRealtimeChannel {
     removed: false,
     on(_type, filter, callback) {
       bindings.push(`${filter.schema}.${filter.table}`);
-      handlers.set(filter.table, callback);
+      handlers.set(`${filter.schema}.${filter.table}`, callback);
 
       return channel;
     },
@@ -200,7 +209,7 @@ function createChannel(name: string): FakeRealtimeChannel {
       return channel;
     },
     emit(payload) {
-      handlers.get(payload.table)?.(payload);
+      handlers.get(`${payload.schema}.${payload.table}`)?.(payload);
     },
     report: (status, error) => report(status, error),
   };
@@ -224,6 +233,7 @@ export function createFakeSupabase({
   auth = true,
 }: FakeSupabaseOptions = {}): FakeSupabase {
   const calls: string[] = [];
+  const schemas: string[] = [];
   const payloads: Array<Record<string, unknown>> = [];
   const requestedColumns: string[] = [];
   const channels: FakeRealtimeChannel[] = [];
@@ -231,11 +241,13 @@ export function createFakeSupabase({
   let currentUser = user;
 
   const record = (
+    schema: string,
     operation: string,
     count: number | null,
     payload: Record<string, unknown> = {},
   ) => {
     calls.push(operation);
+    schemas.push(schema);
     payloads.push(payload);
 
     return Promise.resolve({ error: respond(calls.length - 1), count });
@@ -272,23 +284,35 @@ export function createFakeSupabase({
     },
   ) as FakeSupabase['auth'];
 
+  const tableApi = (schema: string, table: string): FakeTable => ({
+    upsert: (row: Record<string, unknown>) => record(schema, `upsert:${table}`, null, row),
+    update: (row: Record<string, unknown>) => ({
+      eq: () => record(schema, `update:${table}`, (updatedRows ?? deletedRows)(table), row),
+    }),
+    delete: () => ({ eq: () => record(schema, `delete:${table}`, deletedRows(table)) }),
+    select: (requested = '*') =>
+      createSelect(
+        schema,
+        table,
+        rows[table] ?? [],
+        downloadError,
+        calls,
+        schemas,
+        requested,
+        requestedColumns,
+      ),
+  });
+
   const supabase: FakeSupabase = {
     calls,
+    schemas,
     payloads,
     requestedColumns,
     channels,
     get openChannel() {
       return channels.findLast((channel) => !channel.removed);
     },
-    from: (table: string) => ({
-      upsert: (row: Record<string, unknown>) => record(`upsert:${table}`, null, row),
-      update: (row: Record<string, unknown>) => ({
-        eq: () => record(`update:${table}`, (updatedRows ?? deletedRows)(table), row),
-      }),
-      delete: () => ({ eq: () => record(`delete:${table}`, deletedRows(table)) }),
-      select: (requested = '*') =>
-        createSelect(table, rows[table] ?? [], downloadError, calls, requested, requestedColumns),
-    }),
+    schema: (name: string) => ({ from: (table: string) => tableApi(name, table) }),
     channel(name) {
       const created = createChannel(name);
 

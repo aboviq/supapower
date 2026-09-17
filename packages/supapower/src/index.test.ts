@@ -423,3 +423,51 @@ describe('createSupapower().sync - primary key validation', () => {
     expect(isSupapowerError(thrown) && thrown.code).toBe('schema_mismatch');
   });
 });
+
+describe('createSupapower().sync - tables outside "public"', () => {
+  test('tracks, subscribes and pushes each table where it belongs', async () => {
+    const pg = createFakeWorkerPGlite({
+      isLeader: true,
+      columns: { 'app.todos': ['id', 'title'], 'mirror.notes': ['id', 'title'] },
+      changes: [createChange('100', 1, { schema_name: 'mirror', table_name: 'notes' })],
+    });
+    const supabase = createFakeSupabase({ user: 'user-a' });
+
+    // As after a reload: the queued change belongs to this user, so nothing is
+    // truncated out from under it.
+    pg.metadata.set('SyncedUser', 'user-a');
+
+    const sync = await createSupapower(asPGlite(pg)).sync({
+      supabase: asSupabaseClient(supabase),
+      tables: [
+        { table: 'todos', schema: 'app' },
+        { table: 'notes', schema: 'app', localSchema: 'mirror' },
+      ],
+    });
+
+    await settle();
+
+    expect(ran(pg, 'AFTER INSERT ON "app"."todos"')).toBe(true);
+    expect(ran(pg, 'AFTER INSERT ON "mirror"."notes"')).toBe(true);
+    expect(supabase.openChannel?.bindings).toEqual(['app.todos', 'app.notes']);
+
+    expect(await waitFor(() => supabase.calls.includes('upsert:notes'))).toBe(true);
+    expect(supabase.schemas.every((schema) => schema === 'app')).toBe(true);
+
+    sync.unsubscribe();
+  });
+
+  test('refuses a primary key the table lacks in its local schema', async () => {
+    const pg = createFakeWorkerPGlite({ isLeader: true, columns: { 'app.tags': ['id', 'name'] } });
+
+    const failing = createSupapower(asPGlite(pg)).sync({
+      supabase: idleSupabase,
+      tables: [{ table: 'tags', schema: 'app', primaryKey: 'tag_id' }],
+    });
+
+    const thrown = await failing.catch((error: unknown) => error);
+
+    expect(isSupapowerError(thrown) && thrown.code).toBe('schema_mismatch');
+    expect(String(thrown)).toContain('Table "app"."tags"');
+  });
+});
