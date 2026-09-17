@@ -20,7 +20,7 @@ Local writes to tracked tables are recorded by statement triggers into a `supapo
 The Data API is also used for initially syncing data, and after the initial sync the local PGlite tables are kept up to date via [Supabase's Realtime](https://supabase.com/docs/guides/realtime) engine.
 
 > [!IMPORTANT]
-> For all tables you want to sync both the Data API and Realtime must be enabled.
+> For all tables you want to sync both the Data API and [Realtime](https://supabase.com/docs/guides/realtime/postgres-changes) must be enabled.
 
 > [!CAUTION]
 > You really should enable [Row Level Security](https://supabase.com/docs/guides/database/postgres/row-level-security) for all synced tables to avoid unwanted access.
@@ -32,6 +32,8 @@ Supapower needs both `@supabase/supabase-js` and `@electric-sql/pglite` as peer 
 ```bash
 npm install supapower @electric-sql/pglite @supabase/supabase-js
 ```
+
+(of course, you can use the package manager of your choice, e.g. `bun` or `pnpm`)
 
 ## Usage
 
@@ -89,7 +91,7 @@ export const pg = await PGliteWorker.create(
 
 ### 3. Add the Supapower extension to PGlite
 
-Modify your PGlite client configuration to the following:
+Modify your PGlite client configuration to enable the Supapower extension:
 
 ```diff
 // ./pglite.ts
@@ -110,6 +112,8 @@ export const pg = await PGliteWorker.create(
 
 ### 4. Start the synchronization with Supabase
 
+Use the [`supapower.sync`](#supapowersync) method to initiate the database and start the synchronization with Supabase:
+
 ```ts
 import { pg } from './pglite.js';
 import { supabase } from './supabase.js';
@@ -119,7 +123,7 @@ const sync = await pg.supapower.sync({
   tables: ['todos', 'lists'],
 });
 
-// And to stop the synchronization:
+// And if/when you need to stop the synchronization:
 sync.unsubscribe();
 ```
 
@@ -160,19 +164,17 @@ See each section below for the API specification of each method (or property) in
 
 The main method of the namespace which both initiates the local PGlite database and starts the synchronization with Supabase.
 
-Creates a `supapower` schema in the database with a generic `supapower.changes` table that will contain all unsynced outgoing local changes to tracked tables.
+- Creates a `supapower` schema in the local database
+- Creates a generic `supapower.changes` table with a queue for unsynced outgoing local changes to tracked tables.
+- Attaches statement triggers for `INSERT`, `UPDATE` and `DELETE` operations on each tracked table to add a row to the `supapower.changes` table.
+- Creates a `supapower.metadata` table to store metadata about the synchronization process and current settings.
+- Drains the outgoing queue one local transaction at a time using the provided `supabase` client.
+- Sets up a realtime channel subscription on the provided `supabase` client to track remote changes to the tracked tables.
+- Performs an initial download to bring the local tables up to date with the remote state (can be incremental using the [`cursor`](#table-cursor-configuration) option).
+- Empties user dependent tables on user change or logout.
+- Re-syncs all tracked tables whenever the user changes or logs back in to not miss any updates while offline.
 
-For each tracked table a statement trigger is attached for `INSERT`, `UPDATE` and `DELETE` operations that adds a row to sync to the `supapower.changes` table.
-
-When the database is set up the sync is started. The outgoing queue is drained one local transaction at a time using the provided `supabase` client, and the loop is woken by a `NOTIFY` from the change trigger or by a periodic poll as a fallback.
-
-A realtime channel subscription is also set up on the provided `supabase` client to track remote changes to the tracked tables, and an initial download brings the local tables up to date behind it. Incoming changes are applied in the order they were broadcast, with the change triggers suppressed so an incoming change is not queued straight back up as an outgoing one. A row whose local change is still waiting in the outgoing queue is left as it is - see [Conflicts](#conflicts).
-
-Inserts and updates are applied the same way, as an upsert on the primary key. An update for a row this client never received the insert for therefore still lands, rather than matching nothing at all. Primary keys are assumed never to change.
-
-The channel is subscribed to before the download starts, so a change made while the download is in flight queues up behind the snapshot instead of falling in the gap between the two. The download runs again whenever the channel comes back after dropping: a rejoin replays nothing, so anything that changed during the outage has to be fetched rather than waited for.
-
-Call it in **every** tab. The schema has to exist wherever writes happen, and the tab in charge of draining the queue may change at any time - see [Multi-tab behavior](#multi-tab-behavior) below.
+Uses upserts for inserts and updates to ensure that the local database remains consistent with the remote state. See [Conflicts](#conflicts) for more details.
 
 #### Type signature
 
@@ -224,15 +226,15 @@ For tables provided as a `string`, they are expected to have a primary key colum
 The initial sync is performed in the specified order of the tables provided in the `tables` array.
 
 > [!NOTE]
-> The initial sync asks only for the columns this client's schema has, upserts whole rows on the primary key - which makes re-running it harmless - and never deletes. A row hard deleted remotely while this client was away only disappears locally on the next truncation. Configure [`cursor`](#table-cursor-configuration) to make it ask for only what changed; without it, every start pulls the whole table.
+> The initial sync asks only for the columns this client's schema has, upserts whole rows on the primary key - which makes re-running it harmless - and never deletes. A row hard deleted remotely while this client was away only disappears locally on the next truncation (e.g. on user change or sign out). Configure [`cursor`](#table-cursor-configuration) to make it ask for only what changed; without it, every start pulls the whole table.
 
 ##### Conflicts
 
-A row can be edited in two places at once: locally, while the change is still waiting in the outgoing queue, and remotely by somebody else. Supapower resolves that **per column**.
+A row can be edited in two places at once: locally, while a change is still waiting in the outgoing queue, and remotely by somebody else. Supapower resolves that **per column**.
 
-An update sends only the columns it actually changed, worked out from the before and after images the change trigger recorded. So if you edit `title` offline while somebody else edits `done`, your upload sets `title` and leaves `done` as they left it. The merge happens in Postgres, and both edits survive.
+An update sends only the columns it actually changed, worked out from the before and after state the change trigger recorded. So if you edit `title` offline while somebody else edits `done`, your upload sets `title` and leaves `done` as they left it. The merge happens in Postgres, and both edits survive.
 
-Locally the rule is blunter, and only briefly: **while a row has an unsynced local change, an incoming change for it is not applied.** That is a delay rather than a loss. Your own upload comes back over realtime carrying the whole merged row - `postgres_changes` always sends the full record - and by then the queue is empty, so it lands. The row converges on the version that has both edits.
+Locally the rule is blunter, and only briefly: **while a row has an unsynced local change, an incoming change for it is not applied.** That is a delay rather than a loss. Your own upload comes back over realtime carrying the whole merged row - `postgres_changes` always sends the full record - and by then the queue is empty, so it is applied. The row converges on the version that has both edits.
 
 What that leaves:
 
@@ -243,13 +245,15 @@ What that leaves:
 
 ##### Schema drift
 
-The client's schema is the application's, and it lags behind the remote one whenever the server deploys first. Supapower does not treat that as an error:
+The client's schema is the application's, and it lags behind the remote one whenever the server deploys first.
+
+Supapower does not treat that as an error:
 
 - The download asks Supabase for the columns it knows by name, so a column it has never heard of is never sent.
-- A realtime change that carries one has it trimmed off before the row is written, and the column is reported once per session through [`onError`](#everything-else) as `column_ignored`. The rest of the row still lands.
+- A realtime change that carries a column unknown to the client has it trimmed off before the row is written, and the column is reported once per session through [`onError`](#everything-else) as `column_ignored`. The rest of the row is still applied.
 - An old client never overwrites what it dropped. `upsert` only sets the columns it sends, so a row updated locally keeps the newer column's value upstream.
 
-The value is therefore not lost, only not local yet. Once the application migration adds the column, the stored watermark no longer covers the columns being asked for, and that table is downloaded whole again to fill it in. The same happens if `cursor` is pointed at a different column - a watermark read out of one column says nothing about another.
+The value is therefore not lost, only not local yet. Once the application migration adds the column, the stored watermark no longer covers the columns being asked for, and that table is downloaded whole again to fill it in. The same happens if [`cursor`](#table-cursor-configuration) is pointed at a different column than before.
 
 ##### `SupapowerSync` - The sync handle
 
@@ -283,6 +287,11 @@ interface SupapowerTableConfig {
    */
   cursor?: string;
   /**
+   * Determines the access level required to sync this table.
+   *
+   * - `"anon"` allows anonymous users to sync this table.
+   * - `"authenticated"` requires the user to be signed in to sync this table.
+   *
    * @default "authenticated"
    */
   access?: 'anon' | 'authenticated';
@@ -291,7 +300,7 @@ interface SupapowerTableConfig {
 
 ###### Table `cursor` configuration
 
-Without a `cursor` every start downloads the whole table. Point it at a timestamp column that is set to the current time on every write and the download after the first only asks for rows at or after the last value it saw:
+Without a `cursor` every start, or user change, downloads the whole table. Point it at a timestamp column that is set to the current time on every write (preferably using a trigger in the remote database) and the download after the first only asks for rows at or after (with a bit of margin, see below) the last value it saw:
 
 ```ts
 { table: 'todos', cursor: 'updated_at' }
@@ -302,10 +311,9 @@ Supabase has no built-in "give me everything since" - the Data API only queries 
 Three things to know about it:
 
 - **The download reaches a minute further back than the last value it saw.** A write stamps its timestamp with the transaction's start time but only becomes visible when it commits, so a slow transaction can land a row behind a watermark that has already moved past it. The margin covers transactions up to a minute; anything slower is missed until the table is downloaded whole again.
-- **Hard `DELETE`s cannot be picked up this way.** The row is simply gone, so nothing comes back to say so. Use soft deletes, and read the schema recommendations below.
-- **A row that becomes visible without changing is invisible to it.** An incremental download asks for rows whose timestamp moved. Being added to a shared project does not move any timestamp on the project's rows - they were there all along, you just could not see them - so they are never fetched. Realtime does not help either: it only delivers rows that actually change. See the schema recommendations below for what to do about it.
-
-The watermark is per table and records what it is worth: the value, the column it was read from, and the columns the download asked for. Change either and it no longer applies, and the table is pulled whole again - see [schema drift](#schema-drift). It is also forgotten whenever the table is truncated, so a user change always starts from a whole download.
+- **Hard `DELETE`s cannot be picked up this way.** The row is simply gone, so nothing comes back to say so. Use soft deletes, and read the [schema recommendations](#schema-recommendations) below.
+- **A row that becomes visible without changing is invisible to it.** An incremental download asks for rows whose timestamp moved. Being added to a shared project does not move any timestamp on the project's rows - they were there all along, you just could not see them - so they are never fetched. Realtime does not help either: it only delivers rows that actually change. See the [schema recommendations](#schema-recommendations) below for what to do about it.
+- **A full download will still happen in some cases:** the `cursor` is changed to another column, or the the local tracked table's schema changed, or the table [depends on the current user](#table-access-configuration) and it changed.
 
 ###### Table `access` configuration
 
@@ -314,9 +322,10 @@ The `access` configuration for a table controls what happens when a user signs i
 - `authenticated` (default) - truncates the table on user sign in and sign out, i.e. it's expected to be user dependent and won't be synced at all if there is no authenticated user
 - `anon` - never truncates the table and it's synced even when there's no authenticated user
 
-The realtime subscription follows this setting: `anon` tables are subscribed to at all times, the rest only while somebody is signed in. It is rebuilt when the signed in user changes, and deliberately left alone when only the access token was refreshed - supabase-js pushes a refreshed token onto the realtime socket by itself, so re-subscribing would drop messages for nothing.
+The realtime subscription follows this setting: `anon` tables are subscribed to at all times, the rest only while somebody is signed in. It is rebuilt when the signed in user changes, and deliberately left alone when only the access token was refreshed - supabase-js pushes a refreshed token onto the realtime socket by itself, so no need to re-subscribe manually.
 
-A client created with the [`accessToken` option](https://supabase.com/docs/reference/javascript/initializing) owns its own token and has no auth state to follow, so all of its tables are treated as reachable.
+> [!NOTE]
+> A client created with the [`accessToken` option](https://supabase.com/docs/reference/javascript/initializing) owns its own token and has no auth state to follow, so all of its tables are treated as reachable.
 
 When the signed in user changes - in either direction - the `authenticated` tables are truncated before anything is downloaded for the new one, and the outgoing queue is cleared of their changes too.
 
@@ -348,11 +357,11 @@ instance, so `pg_advisory_lock()` is invisible to the other tabs and would block
 this one has. Supapower coordinates in the browser instead, and picks the strongest mechanism the
 runtime offers:
 
-| `leadership`     | When                                   | Mechanism                                                                                                                  |
-| ---------------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `worker-leader`  | The database is a `PGliteWorker`       | PGlite's own leader election - the tab that hosts the database                                                             |
-| `web-lock`       | A plain `PGlite` instance in a browser | An exclusive [Web Lock](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) named `supapower:outgoing:<scope>` |
-| `single-process` | Node, Bun, Deno                        | None - a second process is assumed not to exist                                                                            |
+| `leadership`     | When                                                                         | Mechanism                                                                                                                  |
+| ---------------- | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `worker-leader`  | The database is a [`PGliteWorker`](https://pglite.dev/docs/multi-tab-worker) | PGlite's own leader election - the tab that hosts the database                                                             |
+| `web-lock`       | A plain `PGlite` instance in a browser                                       | An exclusive [Web Lock](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) named `supapower:outgoing:<scope>` |
+| `single-process` | Node, Bun, Deno                                                              | None - a second process is assumed not to exist                                                                            |
 
 Leadership is handed over on its own: a Web Lock is released by the browser when the tab closes or
 crashes, and `PGliteWorker` re-runs its election. The waiting tab takes over and resumes draining
@@ -368,7 +377,7 @@ where the previous one left off. Read `sync.leadership` to see which mechanism y
 
 A failed upload is one of two things, and Supapower treats them differently.
 
-**Transient** - offline, a 5xx, a dropped connection. The batch stays queued and is retried with an
+**Transient** - offline, a 5xx, a dropped connection. The outgoing batch stays queued and is retried with an
 exponential backoff, from 1 second up to a minute.
 
 **Unrecoverable** - a data type mismatch (Postgres class `22`), an integrity constraint violation
@@ -472,8 +481,7 @@ indistinguishable from the client - the row is gone upstream, or you may not wri
 
 ### Entry points
 
-Everything needed for the common case is on the package root. The rest is split per module so that
-go-to-definition lands on the definition rather than on a re-export.
+Everything needed for the common case is on the package root. The rest is split per module.
 
 | Import                 | Contains                                                                               |
 | ---------------------- | -------------------------------------------------------------------------------------- |
@@ -508,14 +516,15 @@ Recommendations are for either the client (<kbd>C</kbd>) or the server (<kbd>S</
 
 - <kbd>C</kbd> make all columns nullable, except the primary key
   - if you're really sure some other columns will never ever be missing in the future (like `created_at`) you can keep them non-nullable as well
+  - but if a column is non-nullable but set by a trigger in the backend (e.g. `updated_at`) it is easier to keep it nullable in the client schema
 - <kbd>S</kbd> give every column you add later a default, or make it nullable
   - an older client creating a row only sends the columns it knows about, so a new `NOT NULL` column without a default fails its insert with `23502`
   - `23502` counts as [unrecoverable](#error-handling), so the change is discarded rather than retried: every client still on the previous version silently stops being able to create rows
 - <kbd>C</kbd> remove all foreign key constraints
-  - keep the columns, but remove the constraints as we don't know in which order rows will be synced
+  - keep the columns, but remove the constraints as we don't know/can't guarantee in which order rows will be synced
 - <kbd>C</kbd><kbd>S</kbd> prefer soft deletes over `DELETE` queries, i.e. use a `deleted_at` column or similar and filter all queries with it
   - this recommendation is for the Supabase migrations as well because realtime events for deleted rows are not sent by default (see [Delete events limitation](https://supabase.com/docs/guides/realtime/postgres-changes#delete-events))
-  - even if delete events are received via the realtime engine they will only sync to online users, this means that rows deleted by other users while you are offline will still be in your client's database
+  - even with full replication and delete events are received via the realtime engine they will only sync to online users, this means that rows deleted by other users while you are offline will still be in your client's database
   - **bump `updated_at` in the same statement that sets `deleted_at`**, otherwise the deletion never reaches a client that is using [`cursor`](#table-cursor-configuration): an incremental download only asks for rows whose timestamp moved, so a soft delete that leaves `updated_at` alone is invisible to every client that was offline when it happened
 - <kbd>C</kbd><kbd>S</kbd> give every synced table an `updated_at` column maintained by a trigger
   - a trigger rather than application code, so that no write path can forget it - one missed update is a row that silently stops syncing to offline clients
@@ -530,13 +539,13 @@ Recommendations are for either the client (<kbd>C</kbd>) or the server (<kbd>S</
     ```
 
   - it is worth doing from a trigger on the membership table so that no code path granting access can forget, and worth keeping in mind when writing row-level security policies: **whatever a policy reads, a change to it has to move the timestamp of every row the policy decides about**
-- <kbd>C</kbd><kbd>S</kbd> use uuid's as primary keys
+- <kbd>C</kbd><kbd>S</kbd> use `uuid`'s as primary keys
   - as the primary key is shared between the client and server databases and can be created at any end they shouldn't be able to collide, which is why a sequence number won't work
 - <kbd>C</kbd><kbd>S</kbd> have a single primary key in every table that you want to sync
   - support for compound primary keys in Supapower has not been implemented yet
   - from my experience even when you want compound primary keys it's usually better to have a single PK with a unique key for the compound keys instead
 
-Conclusion: relax your client database schema, use soft deletes and always use single primary keys as `uuid` columns.
+**Conclusion:** relax your client database schema, have an `updated_at` column in every table (updated by triggers), use soft deletes and always use single primary keys as `uuid` columns.
 
 ## License
 
