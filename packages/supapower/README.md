@@ -1,7 +1,7 @@
 <picture>
   <source srcset="https://raw.githubusercontent.com/aboviq/supapower/main/assets/supapower-dark.png" media="(prefers-color-scheme: dark)">
   <source srcset="https://raw.githubusercontent.com/aboviq/supapower/main/assets/supapower-light.png" media="(prefers-color-scheme: light)">
-  <img src="https://raw.githubusercontent.com/aboviq/supapower/main/assets/supapower-light.png" alt="Supapower">
+  <img src="https://raw.githubusercontent.com/aboviq/supapower/main/assets/supapower-fallback.png" alt="Supapower - With Supapower comes great sync abilities">
 </picture>
 
 # `supapower`

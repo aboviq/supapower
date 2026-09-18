@@ -1,7 +1,7 @@
 <picture>
   <source srcset="assets/supapower-dark.png" media="(prefers-color-scheme: dark)">
   <source srcset="assets/supapower-light.png" media="(prefers-color-scheme: light)">
-  <img src="assets/supapower-light.png" alt="Supapower">
+  <img src="assets/supapower-fallback.png" alt="Supapower - With Supapower comes great sync abilities">
 </picture>
 
 # Supapower
