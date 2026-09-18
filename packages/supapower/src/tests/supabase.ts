@@ -86,6 +86,9 @@ interface SelectResult {
 /** A thenable query builder, the shape PostgREST's own builder has. */
 export interface FakeSelect extends PromiseLike<SelectResult> {
   gte(column: string, value: string): FakeSelect;
+  gt(column: string, value: unknown): FakeSelect;
+  order(column: string, options?: { ascending?: boolean }): FakeSelect;
+  limit(count: number): FakeSelect;
   /** Type-level on the real builder; here it just keeps the chain going. */
   overrideTypes<_T, _Options = { merge: true }>(): FakeSelect;
 }
@@ -143,11 +146,31 @@ function createSelect(
 ): FakeSelect {
   let filter: string | undefined;
   let from: string | undefined;
+  let gtColumn: string | undefined;
+  let gtValue: unknown;
+  let orderColumn: string | undefined;
+  let limitCount: number | undefined;
 
   const select: FakeSelect = {
     gte(column, value) {
       filter = column;
       from = value;
+
+      return select;
+    },
+    gt(column, value) {
+      gtColumn = column;
+      gtValue = value;
+
+      return select;
+    },
+    order(column) {
+      orderColumn = column;
+
+      return select;
+    },
+    limit(count) {
+      limitCount = count;
 
       return select;
     },
@@ -168,7 +191,7 @@ function createSelect(
 
       const error = downloadError(table);
 
-      const matching =
+      let matching =
         column === undefined || lowest === undefined
           ? rows
           : rows.filter((row) => {
@@ -176,6 +199,20 @@ function createSelect(
 
               return typeof value === 'string' && value >= lowest;
             });
+
+      if (gtColumn !== undefined) {
+        matching = matching.filter((row) => String(row[gtColumn as string]) > String(gtValue));
+      }
+
+      if (orderColumn !== undefined) {
+        const key = orderColumn;
+
+        matching = matching.toSorted((a, b) => (String(a[key]) > String(b[key]) ? 1 : -1));
+      }
+
+      if (limitCount !== undefined) {
+        matching = matching.slice(0, limitCount);
+      }
 
       return Promise.resolve({ data: error ? [] : matching, error }).then(onResolved, onRejected);
     },

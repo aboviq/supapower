@@ -310,7 +310,7 @@ describe('createSupapower().sync - initial download', () => {
     const sync = await start(supabase, pg);
 
     expect(await waitFor(() => supabase.calls.includes('select:plans'))).toBe(true);
-    expect(supabase.calls).toEqual(['select:todos', 'select:plans']);
+    expect(supabase.calls).toEqual(['select:todos', 'select:todos', 'select:plans']);
     expect(pg.statements.some((s) => s.includes('INSERT INTO "public"."todos"'))).toBe(true);
 
     sync.unsubscribe();

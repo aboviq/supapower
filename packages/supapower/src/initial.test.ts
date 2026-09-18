@@ -17,6 +17,12 @@ const live = () => new AbortController().signal;
 const applied = (pg: { statements: string[] }) =>
   pg.statements.filter((statement) => statement.startsWith('INSERT INTO "public"'));
 
+const rowsOf = (count: number) =>
+  Array.from({ length: count }, (_, index) => ({
+    id: index + 1,
+    updated_at: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+  }));
+
 describe('runInitialSync', () => {
   test('downloads every table in the configured order', async () => {
     const pg = createFakePGlite();
@@ -223,7 +229,7 @@ describe('runInitialSync - incremental with a cursor', () => {
       signal: live(),
     });
 
-    expect(supabase.calls).toEqual(['select:todos', 'select:plans']);
+    expect(supabase.calls).toEqual(['select:todos', 'select:todos', 'select:plans']);
     expect(pg.metadata.get('SyncedCursorAt')).toEqual({
       '"public"."todos"': {
         at: '2026-01-01T12:00:00.000Z',
@@ -250,7 +256,9 @@ describe('runInitialSync - incremental with a cursor', () => {
 
     expect(supabase.calls).toEqual([
       'select:todos',
+      'select:todos',
       'select:plans',
+      'select:todos:gte(updated_at)',
       'select:todos:gte(updated_at)',
       // No cursor configured, so this one is still pulled whole.
       'select:plans',
@@ -334,6 +342,8 @@ describe('runInitialSync - incremental with a cursor', () => {
     expect(supabase.calls.filter((call) => call.startsWith('select:todos'))).toEqual([
       'select:todos',
       'select:todos',
+      'select:todos',
+      'select:todos',
     ]);
   });
 
@@ -398,8 +408,18 @@ describe('runInitialSync - schema drift', () => {
       }),
     );
 
-    expect(supabase.calls).toEqual(['select:todos', 'select:todos']);
-    expect(supabase.requestedColumns).toEqual(['todos:id,updated_at', 'todos:id,title,updated_at']);
+    expect(supabase.calls).toEqual([
+      'select:todos',
+      'select:todos',
+      'select:todos',
+      'select:todos',
+    ]);
+    expect(supabase.requestedColumns).toEqual([
+      'todos:id,updated_at',
+      'todos:id,updated_at',
+      'todos:id,title,updated_at',
+      'todos:id,title,updated_at',
+    ]);
   });
 
   test('keeps using the watermark when a column was only removed', async () => {
@@ -425,7 +445,12 @@ describe('runInitialSync - schema drift', () => {
 
     // Nothing was lost upstream by dropping a column locally, so there is
     // nothing to fetch again.
-    expect(supabase.calls).toEqual(['select:todos', 'select:todos:gte(updated_at)']);
+    expect(supabase.calls).toEqual([
+      'select:todos',
+      'select:todos',
+      'select:todos:gte(updated_at)',
+      'select:todos:gte(updated_at)',
+    ]);
   });
 
   test('pulls the whole table again when the cursor column changes', async () => {
@@ -449,7 +474,75 @@ describe('runInitialSync - schema drift', () => {
 
     // The stored value came out of a different column; comparing the new one
     // against it would quietly fetch the wrong set.
-    expect(supabase.calls).toEqual(['select:todos', 'select:todos']);
+    expect(supabase.calls).toEqual([
+      'select:todos',
+      'select:todos',
+      'select:todos',
+      'select:todos',
+    ]);
+  });
+});
+
+describe('runInitialSync - pagination', () => {
+  test('pages through every row of a table bigger than one page', async () => {
+    const pg = createFakePGlite();
+    const rows = rowsOf(2500);
+    const supabase = createFakeSupabase({ rows: { todos: rows } });
+    const paged = resolveTablesWith([{ table: 'todos', cursor: 'updated_at' }], {
+      todos: ['id', 'updated_at'],
+    });
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables: paged,
+      signal: live(),
+    });
+
+    expect(applied(pg)).toHaveLength(2500);
+    expect(pg.metadata.get('SyncedCursorAt')).toEqual({
+      '"public"."todos"': {
+        at: rows.at(-1)?.updated_at,
+        cursor: 'updated_at',
+        columns: ['id', 'updated_at'],
+      },
+    });
+    // Three full pages plus the empty page that ends the loop.
+    expect(supabase.calls.filter((call) => call.startsWith('select:todos'))).toHaveLength(4);
+  });
+
+  test('never writes a watermark for a table that failed partway through paging', async () => {
+    const pg = createFakePGlite();
+    let attempt = 0;
+    const supabase = createFakeSupabase({
+      rows: { todos: rowsOf(1500) },
+      downloadError: (table) => {
+        if (table !== 'todos') {
+          return null;
+        }
+
+        attempt += 1;
+
+        // Fails the second page, once the first has already been applied.
+        return attempt === 2 ? { code: '50000', message: 'boom' } : null;
+      },
+    });
+    const paged = resolveTablesWith([{ table: 'todos', cursor: 'updated_at' }], {
+      todos: ['id', 'updated_at'],
+    });
+
+    const failing = runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables: paged,
+      signal: live(),
+    });
+
+    await expect(failing).rejects.toThrow('Could not download "public"."todos" from Supabase');
+
+    const watermark = pg.metadata.get('SyncedCursorAt') as Record<string, unknown> | undefined;
+
+    expect(watermark?.['"public"."todos"']).toBeUndefined();
   });
 });
 

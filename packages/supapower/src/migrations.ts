@@ -190,6 +190,13 @@ export const runMigrations = async (pg: PGliteInterface): Promise<void> => {
  * so - which is far worse than refusing to start.
  */
 const assertPrimaryKey = ({ table, localSchema, primaryKey, columns }: TrackedTable) => {
+  if (columns.length === 0) {
+    throw new SupapowerError(
+      `Table ${escapeIdentifier(localSchema, table)} does not exist in the local database: create it before calling sync()`,
+      { code: 'schema_mismatch' },
+    );
+  }
+
   if (!columns.includes(primaryKey)) {
     throw new SupapowerError(
       `Table ${escapeIdentifier(localSchema, table)} has no column "${primaryKey}" to use as its primary key`,

@@ -92,6 +92,16 @@ describe('trackTables', () => {
     expect(String(thrown)).toContain('Table "public"."tags" has no column "id"');
   });
 
+  test('refuses a table that does not exist in the local database', async () => {
+    const thrown = await trackTables(pg, [
+      { table: 'missing', localSchema: 'public', primaryKey: 'id', columns: [] },
+    ]).catch((error: unknown) => error);
+
+    expect(isSupapowerError(thrown)).toBe(true);
+    expect(isSupapowerError(thrown) && thrown.code).toBe('schema_mismatch');
+    expect(String(thrown)).toContain('"public"."missing" does not exist in the local database');
+  });
+
   test('does not record a change made while applying an incoming one', async () => {
     await trackTables(pg, [
       { table: 'todos', localSchema: 'public', primaryKey: 'id', columns: ['id', 'title'] },

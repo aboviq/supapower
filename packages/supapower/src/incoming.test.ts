@@ -358,6 +358,47 @@ describe('runIncomingSync - catching up after a dropped channel', () => {
   });
 });
 
+describe('runIncomingSync - retrying a failed download', () => {
+  test('retries rather than giving up on the download for the rest of the session', async () => {
+    let todosAttempts = 0;
+    const supabase = createFakeSupabase({
+      downloadError: (table) => {
+        if (table !== 'todos') {
+          return null;
+        }
+
+        todosAttempts += 1;
+
+        return todosAttempts === 1 ? { code: '50000', message: 'boom' } : null;
+      },
+    });
+    const controller = new AbortController();
+
+    const running = runIncomingSync({
+      pg: asPGlite(createFakePGlite()),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: controller.signal,
+    });
+
+    expect(await waitFor(() => supabase.calls.includes('select:todos'))).toBe(true);
+
+    // Deliberately real time, not a fake clock: `backOff`'s delay is not
+    // injectable without adding test-only surface area, and `bun:test` has
+    // no fake-timer API. RETRY_BASE_MS is 1s and `waitFor` only yields
+    // microtasks, so this is the only way to observe the retry actually fire.
+    await Bun.sleep(1100);
+
+    expect(await waitFor(() => supabase.calls.includes('select:tags'))).toBe(true);
+    expect(supabase.calls.filter((call) => call === 'select:todos').length).toBeGreaterThanOrEqual(
+      2,
+    );
+
+    controller.abort();
+    await running;
+  });
+});
+
 describe('runIncomingSync - tables outside "public"', () => {
   const configured = resolveTablesWith(
     [

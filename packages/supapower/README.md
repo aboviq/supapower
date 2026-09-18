@@ -1,7 +1,7 @@
 <picture>
-  <source srcset="../../assets/supapower-dark.png" media="(prefers-color-scheme: dark)">
-  <source srcset="../../assets/supapower-light.png" media="(prefers-color-scheme: light)">
-  <img src="../../assets/supapower-light.png" alt="Supapower">
+  <source srcset="https://raw.githubusercontent.com/aboviq/supapower/main/assets/supapower-dark.png" media="(prefers-color-scheme: dark)">
+  <source srcset="https://raw.githubusercontent.com/aboviq/supapower/main/assets/supapower-light.png" media="(prefers-color-scheme: light)">
+  <img src="https://raw.githubusercontent.com/aboviq/supapower/main/assets/supapower-light.png" alt="Supapower">
 </picture>
 
 # `supapower`
@@ -9,7 +9,7 @@
 The core for [Supapower](https://github.com/aboviq/supapower), a sync engine that keeps a
 local PGlite database in sync with Supabase inspired by PowerSync.
 
-> **Status:** early groundwork. The public API is still taking shape and will change.
+> **Status:** 0.1.0. Both directions of the sync work; the public API may still change before 1.0.
 
 ## How it works?
 
@@ -173,6 +173,9 @@ await pg.sql`INSERT INTO todos (title) VALUES (${'Test Supapower'})`;
 Do the same from a different browser or from Supabase Studio and notice the live query result updating in the console.
 
 **There you have it!**
+
+> [!NOTE]
+> A complete runnable app is in [`example/chat`](https://github.com/aboviq/supapower/tree/main/example/chat) - a terminal chat syncing two PGlite databases through Supabase.
 
 ## API
 

@@ -59,6 +59,9 @@ const RETRY_MAX_MS = 60_000;
  */
 const CURSOR_MARGIN_MS = 60_000;
 
+/** Supabase's default PostgREST `max-rows` cap per request. */
+const DOWNLOAD_PAGE_SIZE = 1_000;
+
 /**
  * Fills in everything a table entry left out.
  *
@@ -654,7 +657,7 @@ async function downloadTable(
   signal: AbortSignal,
   events: SupapowerEventTarget,
 ): Promise<void> {
-  const { cursor, columns } = config;
+  const { cursor, columns, primaryKey } = config;
   const name = localName(config);
   events.dispatchEvent(new SupapowerTableEvent('downloadTableStart', config));
 
@@ -670,69 +673,103 @@ async function downloadTable(
   // pulls the whole table rather than guessing at how to step back from it.
   const from = Number.isNaN(since) ? null : new Date(since - CURSOR_MARGIN_MS).toISOString();
 
-  // Asking for the columns this client has keeps a column it does not know
-  // about out of the download entirely, rather than trimming it off on arrival.
-  const select = remote(supabase, config).select(columns.map(selectable).join(','));
-  const query = cursor && from ? select.gte(cursor, from) : select;
+  let highest: string | null = null;
 
-  const { data, error } = await query.overrideTypes<
-    Array<Record<string, unknown>>,
-    { merge: false }
-  >();
+  // Seeded with the value already stored, so the same comparison that finds
+  // the furthest along row also keeps the watermark moving only forwards: a
+  // hard deleted row can drag the highest value in the table backwards, and
+  // reaching further back next time is pointless.
+  let highestAt = Number.isNaN(since) ? Number.NEGATIVE_INFINITY : since;
 
-  if (error) {
-    throw new SupapowerError(
-      `Could not download ${remoteName(config)} from Supabase: ${error.message}`,
-      { code: 'download_failed', cause: error },
-    );
-  }
+  // Keyset paged on the primary key: Supabase caps a single response at
+  // {@link DOWNLOAD_PAGE_SIZE} rows, so one request would silently truncate any
+  // table bigger than that. Paging stops on an empty page rather than a short
+  // one - a project configured with a lower cap would otherwise return a short
+  // page for a table that still has more rows, and stopping there would
+  // reintroduce the truncation this loop exists to remove.
+  let last: unknown = null;
 
-  if (signal.aborted) {
-    return; // cut short by a leadership change; not a finish
-  }
+  for (;;) {
+    // Asking for the columns this client has keeps a column it does not know
+    // about out of the download entirely, rather than trimming it off on arrival.
+    const select = remote(supabase, config).select(columns.map(selectable).join(','));
+    const filtered = cursor && from ? select.gte(cursor, from) : select;
+    const paged = last === null ? filtered : filtered.gt(primaryKey, last);
 
-  if (data.length === 0) {
-    events.dispatchEvent(new SupapowerTableEvent('downloadTableFinish', config));
+    const { data, error } = await paged
+      .order(primaryKey, { ascending: true })
+      .limit(DOWNLOAD_PAGE_SIZE)
+      .overrideTypes<Array<Record<string, unknown>>, { merge: false }>();
 
-    return;
-  }
-
-  // One transaction for the whole table: a half applied snapshot is worse than
-  // no snapshot, and it keeps the per row round trips off the shared worker.
-  await pg.transaction(async (tx) => {
-    let highest: string | null = null;
-
-    // Seeded with the value already stored, so the same comparison that finds
-    // the furthest along row also keeps the watermark moving only forwards: a
-    // hard deleted row can drag the highest value in the table backwards, and
-    // reaching further back next time is pointless.
-    let highestAt = Number.isNaN(since) ? Number.NEGATIVE_INFINITY : since;
-
-    for (const row of data) {
-      await handleIncomingChange(tx, asInsertEvent(config, row, snapshotAt), config);
-
-      if (cursor === undefined) {
-        continue;
-      }
-
-      const value = row[cursor];
-
-      if (typeof value !== 'string') {
-        continue;
-      }
-
-      const at = Date.parse(value);
-
-      if (!Number.isNaN(at) && at > highestAt) {
-        highest = value;
-        highestAt = at;
-      }
+    if (error) {
+      throw new SupapowerError(
+        `Could not download ${remoteName(config)} from Supabase: ${error.message}`,
+        { code: 'download_failed', cause: error },
+      );
     }
 
-    if (highest !== null && cursor !== undefined) {
-      await setSyncedCursorAt(tx, name, { at: highest, cursor, columns: [...columns] });
+    if (signal.aborted) {
+      return; // cut short by a leadership change; not a finish
     }
-  });
+
+    if (data.length === 0) {
+      break;
+    }
+
+    // Each page applies atomically, not the whole table: a partially
+    // downloaded table is indistinguishable from a not-yet-downloaded one,
+    // because every row is an upsert on the primary key.
+    await pg.transaction(async (tx) => {
+      for (const row of data) {
+        await handleIncomingChange(tx, asInsertEvent(config, row, snapshotAt), config);
+
+        if (cursor === undefined) {
+          continue;
+        }
+
+        const value = row[cursor];
+
+        if (typeof value !== 'string') {
+          continue;
+        }
+
+        const at = Date.parse(value);
+
+        if (!Number.isNaN(at) && at > highestAt) {
+          highest = value;
+          highestAt = at;
+        }
+      }
+    });
+
+    const lastKey = data[data.length - 1]?.[primaryKey];
+
+    if (lastKey === null || lastKey === undefined) {
+      events.dispatchEvent(
+        new SupapowerErrorEvent(
+          new SupapowerError(
+            `Could not page ${remoteName(config)}: a row came back without a "${primaryKey}"`,
+            { code: 'download_failed' },
+          ),
+        ),
+      );
+
+      return;
+    }
+
+    last = lastKey;
+  }
+
+  // Written once, after the whole table has paged through: a watermark
+  // written mid-table would claim coverage of rows that ordering by primary
+  // key has not reached yet.
+  if (highest !== null && cursor !== undefined) {
+    const at = highest;
+
+    await pg.transaction(async (tx) => {
+      await setSyncedCursorAt(tx, name, { at, cursor, columns: [...columns] });
+    });
+  }
 
   events.dispatchEvent(new SupapowerTableEvent('downloadTableFinish', config));
 }
@@ -846,18 +883,23 @@ export async function runIncomingSync({
   // the order they were broadcast.
   let applying: Promise<void> = Promise.resolve();
 
-  const enqueue = (task: () => Promise<void>) => {
+  // Resolves `true` once `task` has run, `false` if it was skipped by an
+  // abort or failed and dispatched an `error` event - so a caller such as
+  // `download` below can tell a real failure apart from a completed run.
+  const enqueue = (task: () => Promise<void>): Promise<boolean> => {
     const previous = applying;
 
-    applying = (async () => {
+    const done = (async () => {
       await previous;
 
       if (signal.aborted) {
-        return;
+        return false;
       }
 
       try {
         await task();
+
+        return true;
       } catch (error: unknown) {
         // Caught per task so one bad row cannot break the chain for the rest.
         events.dispatchEvent(
@@ -865,8 +907,14 @@ export async function runIncomingSync({
             asSupapowerError(error, 'Could not apply a remote change', 'apply_failed'),
           ),
         );
+
+        return false;
       }
     })();
+
+    applying = done.then(() => undefined);
+
+    return done;
   };
 
   // Reported once per column per session: a schema that has drifted drifts for
@@ -912,7 +960,32 @@ export async function runIncomingSync({
     );
   }
 
-  const download = () => enqueue(() => runInitialSync({ pg, supabase, tables, signal, events }));
+  // Guards against a re-subscribe starting a second retry loop while one is
+  // already working through the same download; `download()` never rejects, so
+  // every call site can fire it without awaiting.
+  let downloading = false;
+
+  const download = async (): Promise<void> => {
+    if (downloading) {
+      return;
+    }
+
+    downloading = true;
+
+    try {
+      for (let attempt = 0; !signal.aborted; attempt += 1) {
+        if (await enqueue(() => runInitialSync({ pg, supabase, tables, signal, events }))) {
+          return;
+        }
+
+        // Outside `enqueue`, so realtime changes keep applying between
+        // attempts; only the attempt itself occupies the `applying` chain.
+        await backOff(signal, attempt);
+      }
+    } finally {
+      downloading = false;
+    }
+  };
 
   // Whether the channel has dropped since the last download. realtime-js
   // rejoins on its own but replays nothing, so anything that changed while it

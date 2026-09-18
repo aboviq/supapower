@@ -10,8 +10,7 @@ Supapower is a sync engine that keeps a local [PGlite](https://pglite.dev/) data
 [Supabase](https://supabase.com/), so an application can read and write locally and stay usable
 while offline. It is inspired by [PowerSync](https://www.powersync.com/).
 
-> **Status:** early groundwork. The repository holds the toolchain and the first package; the sync
-> engine itself is still being built.
+> **Status:** 0.1.0. Both directions of the sync work; the public API may still change before 1.0.
 
 ## Documentation
 
