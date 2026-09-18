@@ -144,7 +144,7 @@ const sync = await pg.supapower.sync({
 });
 
 // And if/when you need to stop the synchronization:
-sync.unsubscribe();
+await sync.unsubscribe();
 ```
 
 ### 5. Execute queries and profit
@@ -215,7 +215,9 @@ interface SupapowerSyncOptions {
   /**
    * An optional AbortSignal to cancel the synchronization process.
    *
-   * Aborting it is equivalent to calling `unsubscribe()`.
+   * Aborting it is equivalent to calling `unsubscribe()`. An abort event
+   * cannot be awaited, so call `unsubscribe()` as well when you need to know
+   * the teardown has finished.
    */
   signal?: AbortSignal;
   /**
@@ -278,10 +280,11 @@ interface SupapowerSync {
    */
   readonly leadership: 'worker-leader' | 'web-lock' | 'single-process';
   /**
-   * Stops the synchronization process. Local changes are still
-   * tracked. Safe to call more than once.
+   * Stops the synchronization process. Local changes are still tracked.
+   * Resolves once the realtime channel has been left. Never rejects.
+   * Safe to call more than once.
    */
-  unsubscribe(): void;
+  unsubscribe(): Promise<void>;
 }
 ```
 

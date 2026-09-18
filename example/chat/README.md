@@ -117,4 +117,4 @@ app - that is expected until the credentials and the table above are both in pla
 ## Controls
 
 - `Enter` sends the message currently in the input field.
-- `Ctrl+C` quits and unsubscribes from the sync.
+- `Ctrl+C` quits, waits for the sync teardown, then exits.

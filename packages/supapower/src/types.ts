@@ -128,7 +128,10 @@ export interface SupapowerSyncOptions {
   /**
    * An optional AbortSignal to cancel the sync operation.
    *
-   * Aborting it is equivalent to calling {@link SupapowerSync.unsubscribe}.
+   * Aborting it is equivalent to calling {@link SupapowerSync.unsubscribe}. An
+   * event listener cannot be awaited, so call `unsubscribe()` as well when you
+   * need to know the teardown has finished - it is idempotent and returns the
+   * same promise.
    */
   signal?: AbortSignal;
   /**
@@ -185,13 +188,18 @@ export interface SupapowerSync {
    *
    * Local changes will still be tracked but the queue of outgoing changes will no longer be processed.
    *
-   * Returns as soon as the sync has been signalled to stop. Leaving the realtime
-   * channel is a round trip to the server and settles shortly afterwards, so do
-   * not tear the Supabase client down in the same tick.
+   * Everything that can stop synchronously has stopped by the time this returns;
+   * the promise resolves once the rest has too - leaving the realtime channel is
+   * a round trip to the server, and a change being applied locally is awaited
+   * out. Await it before tearing the Supabase client down or exiting the
+   * process, ignore it to stop without waiting.
    *
-   * Safe to call more than once.
+   * Never rejects: anything that fails while stopping is reported through the
+   * `error` event.
+   *
+   * Safe to call more than once - every call resolves with the same teardown.
    */
-  unsubscribe(): void;
+  unsubscribe(): Promise<void>;
 }
 
 export interface SupapowerNamespace {

@@ -99,8 +99,14 @@ describe('createSupapower().sync', () => {
 
     expect(pg.leaderListeners).toBe(1);
 
-    sync.unsubscribe();
-    sync.unsubscribe();
+    const stopping = sync.unsubscribe();
+
+    // Releasing leadership happens before the first await, so it is already
+    // done; the promise only covers what could not stop synchronously.
+    expect(pg.leaderListeners).toBe(0);
+
+    await stopping;
+    await sync.unsubscribe();
 
     expect(pg.leaderListeners).toBe(0);
   });
@@ -234,17 +240,30 @@ describe('createSupapower().sync - incoming subscription', () => {
     sync.unsubscribe();
   });
 
-  test('closes the channel on unsubscribe', async () => {
+  test('unsubscribe resolves once the channel has been left', async () => {
     const supabase = createFakeSupabase({ user: 'user-a' });
 
     const sync = await start(supabase);
     const channel = supabase.openChannel;
 
-    sync.unsubscribe();
+    await sync.unsubscribe();
 
-    // `unsubscribe()` returns as soon as it has signalled; leaving the channel
-    // is a round trip to the server and settles a moment later.
-    expect(await waitFor(() => channel?.removed === true)).toBe(true);
+    expect(channel?.removed).toBe(true);
+  });
+
+  test('reports a channel it could not leave instead of rejecting', async () => {
+    const supabase = createFakeSupabase({ user: 'user-a', removeChannelError: true });
+    const supapower = createSupapower(asPGlite(createFakeWorkerPGlite({ isLeader: true })));
+    const codes: string[] = [];
+
+    supapower.events.addEventListener('error', ({ error }) => codes.push(error.code));
+
+    const sync = await supapower.sync({ supabase: asSupabaseClient(supabase), tables });
+
+    await settle();
+    await sync.unsubscribe();
+
+    expect(codes).toContain('connection_failed');
   });
 
   test('does not subscribe at all when another tab is the leader', async () => {

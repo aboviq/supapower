@@ -116,6 +116,8 @@ export interface FakeSupabaseOptions {
    * is what supabase-js installs for a client built with `accessToken`.
    */
   auth?: boolean;
+  /** Fails `removeChannel()`, the way an already dead socket does. */
+  removeChannelError?: boolean;
 }
 
 /** Hands the fake to code that expects the real thing. */
@@ -231,6 +233,7 @@ export function createFakeSupabase({
   downloadError = () => null,
   user = null,
   auth = true,
+  removeChannelError = false,
 }: FakeSupabaseOptions = {}): FakeSupabase {
   const calls: string[] = [];
   const schemas: string[] = [];
@@ -323,7 +326,9 @@ export function createFakeSupabase({
     removeChannel(channel) {
       (channel as { removed: boolean }).removed = true;
 
-      return Promise.resolve('ok');
+      return removeChannelError
+        ? Promise.reject(new Error('channel is already closed'))
+        : Promise.resolve('ok');
     },
     auth: auth ? authApi : throwingAuth,
     setUser(userId) {

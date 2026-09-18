@@ -2,7 +2,8 @@ import type { PGliteInterface } from '@electric-sql/pglite';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import type { UnrecoverableUploadError } from './changes.js';
-import { createSupapowerEvents, type SupapowerEventTarget } from './events.js';
+import { asSupapowerError } from './errors.js';
+import { createSupapowerEvents, SupapowerErrorEvent, type SupapowerEventTarget } from './events.js';
 import { createLeadership } from './leadership.js';
 import { readLocalColumns, runMigrations, trackTables } from './migrations.js';
 import {
@@ -95,6 +96,9 @@ function reachableTables(
  *
  * Both directions share one signal per identity, so signing out aborts an
  * upload in flight rather than letting it finish as the wrong user.
+ *
+ * @returns A promise that resolves once `signal` has aborted and every
+ * session it started has finished tearing down.
  */
 function superviseSync({
   pg,
@@ -103,9 +107,14 @@ function superviseSync({
   signal,
   events,
   onUnrecoverableError,
-}: SyncSupervisorOptions): void {
+}: SyncSupervisorOptions): Promise<void> {
   let identity: AuthIdentity | undefined;
   let running: AbortController | undefined;
+
+  // Every session started so far. Each one is aborted before the next begins,
+  // but leaving the realtime channel outlives that abort, so a session that has
+  // already been replaced still has to be waited out.
+  let sessions: Promise<void> = Promise.resolve();
 
   const restart = (next: AuthIdentity) => {
     if (signal.aborted || next === identity) {
@@ -119,7 +128,7 @@ function superviseSync({
     const session = running.signal;
     const reachable = reachableTables(tables, next);
 
-    void (async () => {
+    const work = (async () => {
       // Clears out the previous user's rows before anything is downloaded for
       // this one. Reads the user the local data was last synced for from the
       // database, so it also catches a reload with somebody else signed in.
@@ -129,8 +138,8 @@ function superviseSync({
         return;
       }
 
-      // Resolves when the session ends; each loop handles its own failures.
-      void runOutgoingSync({
+      // Both resolve when the session ends; each loop handles its own failures.
+      const outgoing = runOutgoingSync({
         pg,
         supabase,
         tables: reachable,
@@ -139,26 +148,38 @@ function superviseSync({
         ...(onUnrecoverableError ? { onUnrecoverableError } : {}),
       });
 
-      await runIncomingSync({
-        pg,
-        supabase,
-        tables: reachable,
-        signal: session,
-        events,
-      });
-    })();
+      await Promise.all([
+        outgoing,
+        runIncomingSync({ pg, supabase, tables: reachable, signal: session, events }),
+      ]);
+    })().catch((error: unknown) => {
+      // Reported, not thrown: this promise is what `unsubscribe()` hands back,
+      // and a failed teardown must not turn into a rejected cleanup call.
+      events.dispatchEvent(
+        new SupapowerErrorEvent(
+          asSupapowerError(error, 'Could not sync for the current user', 'apply_failed'),
+        ),
+      );
+    });
+
+    sessions = sessions.then(() => work);
   };
 
   const stopWatching = watchAuthIdentity(supabase, restart);
 
-  signal.addEventListener(
-    'abort',
-    () => {
-      stopWatching();
-      running?.abort();
-    },
-    { once: true },
-  );
+  return new Promise<void>((resolve) => {
+    signal.addEventListener(
+      'abort',
+      () => {
+        stopWatching();
+        running?.abort();
+        // Resolving with the chain adopts it: the promise settles once the
+        // aborted session has finished leaving the channel behind.
+        resolve(sessions);
+      },
+      { once: true },
+    );
+  });
 }
 
 /**
@@ -199,15 +220,20 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
       let stopLeadership: (() => void) | undefined;
       let stopped = false;
 
-      const unsubscribe = () => {
-        if (stopped) {
-          return;
+      // Resolves once every supervisor started so far has torn itself down. This is
+      // what `unsubscribe()` returns; leadership can be handed back and forth, so
+      // each turn as leader appends its own teardown.
+      let draining: Promise<void> = Promise.resolve();
+
+      const unsubscribe = async (): Promise<void> => {
+        if (!stopped) {
+          stopped = true;
+          signal?.removeEventListener('abort', unsubscribe);
+          stopLeadership?.();
+          stopLeadership = undefined;
         }
 
-        stopped = true;
-        signal?.removeEventListener('abort', unsubscribe);
-        stopLeadership?.();
-        stopLeadership = undefined;
+        await draining;
       };
 
       const handle: SupapowerSync = { leadership: leadership.strategy, unsubscribe };
@@ -244,7 +270,7 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
       stopLeadership = leadership.subscribe((leaderSignal) => {
         // Both directions run on the leader only: every tab shares one
         // database, so a second syncer would otherwise duplicate every write.
-        superviseSync({
+        const supervisor = superviseSync({
           pg,
           supabase,
           tables: configs,
@@ -252,6 +278,8 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
           events,
           ...(onUnrecoverableError ? { onUnrecoverableError } : {}),
         });
+
+        draining = draining.then(() => supervisor);
       });
 
       return handle;

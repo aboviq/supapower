@@ -977,6 +977,23 @@ export async function runIncomingSync({
       events.dispatchEvent(new Event('disconnect'));
     }
 
-    await Promise.all([supabase.removeChannel(subscription), applying]);
+    // `allSettled`, not `all`: a rejected `removeChannel()` must not cut the
+    // wait for `applying` short - the caller awaits this to know teardown is
+    // done, including changes still mid-apply.
+    const [removed] = await Promise.allSettled([supabase.removeChannel(subscription), applying]);
+
+    if (removed.status === 'rejected') {
+      // Reported, not thrown: the caller awaits this to know the teardown is
+      // done, and a socket that could not be told goodbye does not change that.
+      events.dispatchEvent(
+        new SupapowerErrorEvent(
+          asSupapowerError(
+            removed.reason,
+            `Could not leave the realtime channel "${channel}"`,
+            'connection_failed',
+          ),
+        ),
+      );
+    }
   }
 }

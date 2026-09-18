@@ -58,8 +58,6 @@ const sync = await pg.supapower.sync({
   tables: [{ table: 'messages', access: 'anon' }],
 });
 
-process.on('exit', () => sync.unsubscribe());
-
 function formatTime(value: Date): string {
   return value.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
@@ -192,7 +190,10 @@ const { waitUntilExit } = render(
 
 await waitUntilExit();
 
-// Triggers the `process.on('exit', ...)` handler registered above, which
-// calls `sync.unsubscribe()`. Without this, an open Supabase realtime socket
-// and pending retry timers would keep the process running after Ctrl+C.
+// `process.exit` runs no asynchronous work, and the teardown is asynchronous:
+// leaving the Supabase realtime channel is a round trip to the server. Awaiting
+// it here is what makes the exit below clean - all it still has to do is cut
+// short the pending retry timers that would otherwise keep the process alive.
+await sync.unsubscribe();
+
 process.exit(0);
