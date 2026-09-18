@@ -1,5 +1,11 @@
 # supapower
 
+## 0.2.0
+
+### Minor Changes
+
+- [`616b24c`](https://github.com/aboviq/supapower/commit/616b24ce448efccde60270c119e03f3499fd2245) Thanks [@joakimbeng](https://github.com/joakimbeng)! - Adds `pg.supapower.status`, a PowerSync-like snapshot of what the sync is doing, and a `statusChange` event dispatched on `pg.supapower.events` whenever it changes.
+
 ## 0.1.0
 
 ### Minor Changes
