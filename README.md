@@ -18,9 +18,11 @@ Everything below, except the [examples section](#examples), is for working with 
 
 ## Packages
 
-| Package                              | Description                                                                                                   |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
-| [`supapower`](./packages/supapower/) | The main package for Supapower - a PGlite extension that integrates with Supabase and syncs data between them |
+| Package                                 | Description                                                                                                   |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| [`supapower`](./packages/supapower/)    | The main package for Supapower - a PGlite extension that integrates with Supabase and syncs data between them |
+| [`@supapower/react`](./packages/react/) | React hooks for Supapower: PGlite live queries plus sync status                                               |
+| [`@supapower/vue`](./packages/vue/)     | Vue composables for Supapower: PGlite live queries plus sync status                                           |
 
 ## Examples
 

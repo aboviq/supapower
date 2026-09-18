@@ -1,0 +1,65 @@
+{
+  "name": "@supapower/vue",
+  "version": "0.0.0",
+  "description": "Vue composables for Supapower: PGlite live queries plus sync status",
+  "keywords": [
+    "local-first",
+    "pglite",
+    "supabase",
+    "supapower",
+    "sync",
+    "vue"
+  ],
+  "homepage": "https://github.com/aboviq/supapower/tree/main/packages/vue#readme",
+  "bugs": {
+    "url": "https://github.com/aboviq/supapower/issues"
+  },
+  "license": "Apache-2.0",
+  "author": "Aboviq AB",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aboviq/supapower.git",
+    "directory": "packages/vue"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "@electric-sql/pglite-vue": "^0.4.8"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "supapower": "workspace:*",
+    "vue": "^3.5.43"
+  },
+  "peerDependencies": {
+    "@electric-sql/pglite": ">=0.5.0 <1.0.0",
+    "supapower": ">=0.1.0 <1.0.0",
+    "vue": "^3.3.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
