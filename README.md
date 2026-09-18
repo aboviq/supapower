@@ -15,13 +15,19 @@ while offline. It is inspired by [PowerSync](https://www.powersync.com/).
 
 ## Documentation
 
-Everything below is for working with the monorepo. For documentation on the Supapower library see the [`supapower` package's readme](./packages/supapower/README.md).
+Everything below, except the [examples section](#examples), is for working with the monorepo. For documentation on the Supapower library see the [`supapower` package's readme](./packages/supapower/README.md).
 
 ## Packages
 
 | Package                              | Description                                                                                                   |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
 | [`supapower`](./packages/supapower/) | The main package for Supapower - a PGlite extension that integrates with Supabase and syncs data between them |
+
+## Examples
+
+| Example                   | Description                                                             |
+| ------------------------- | ----------------------------------------------------------------------- |
+| [`chat`](./example/chat/) | A terminal chat app, showing a two-way sync between Supabase and PGlite |
 
 ## Requirements
 

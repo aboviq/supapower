@@ -9,7 +9,8 @@
     "url": "git+https://github.com/aboviq/supapower.git"
   },
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "example/*"
   ],
   "type": "module",
   "scripts": {

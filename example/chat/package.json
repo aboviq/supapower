@@ -1,0 +1,28 @@
+{
+  "name": "chat-example",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A terminal chat app demoing Supapower: messages sync between local PGlite instances through Supabase",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.tsx",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "@electric-sql/pglite-react": "^0.4.8",
+    "@supabase/supabase-js": "^2.116.0",
+    "ink": "^7.1.1",
+    "ink-text-input": "^6.0.0",
+    "react": "^19.3.0",
+    "supapower": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0"
+  },
+  "engines": {
+    "bun": ">=1.4.0",
+    "node": ">=22"
+  }
+}
