@@ -1,11 +1,10 @@
 import { PGlite } from '@electric-sql/pglite';
-import { PGliteProvider, useLiveQuery } from '@electric-sql/pglite-react';
-import { live } from '@electric-sql/pglite/live';
 import { createClient } from '@supabase/supabase-js';
 import { Box, render, Text, useApp, useInput, useStdout } from 'ink';
 import TextInput from 'ink-text-input';
 import { useEffect, useState } from 'react';
-import { supapower } from 'supapower';
+
+import { extensions, PGliteProvider, useLiveQuery, useSupapowerStatus } from '@supapower/react';
 
 import { MESSAGES_TABLE_SQL, type Message } from './schema.js';
 
@@ -41,9 +40,7 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 // start with an empty database and you can watch Supabase bring them in sync.
 console.log('Starting PGlite (in memory)...');
 
-const pg = await PGlite.create({
-  extensions: { supapower, live },
-});
+const pg = await PGlite.create({ extensions });
 
 console.log('Creating the local "messages" table:');
 console.log(MESSAGES_TABLE_SQL);
@@ -82,8 +79,8 @@ interface AppProps {
 function App({ pg: db, userId: myId, userName: myName }: AppProps) {
   const { stdout } = useStdout();
   const [rows, setRows] = useState(stdout.rows);
-  const [connected, setConnected] = useState(false);
-  const [lastError, setLastError] = useState<string | null>(null);
+  const { connected, connecting, downloadError, uploadError } = useSupapowerStatus();
+  const lastError = uploadError ?? downloadError;
   const [input, setInput] = useState('');
   const results = useLiveQuery.sql<Message>`
     SELECT * FROM messages ORDER BY created_at ASC, id ASC
@@ -111,23 +108,6 @@ function App({ pg: db, userId: myId, userName: myName }: AppProps) {
       exit();
     }
   });
-
-  useEffect(() => {
-    const { events } = db.supapower;
-    const onConnect = () => setConnected(true);
-    const onDisconnect = () => setConnected(false);
-    const onError = (event: { error: { message: string } }) => setLastError(event.error.message);
-
-    events.addEventListener('connect', onConnect);
-    events.addEventListener('disconnect', onDisconnect);
-    events.addEventListener('error', onError);
-
-    return () => {
-      events.removeEventListener('connect', onConnect);
-      events.removeEventListener('disconnect', onDisconnect);
-      events.removeEventListener('error', onError);
-    };
-  }, [db]);
 
   const handleSubmit = () => {
     const text = input.trim();
@@ -165,9 +145,9 @@ function App({ pg: db, userId: myId, userName: myName }: AppProps) {
       </Box>
       <Box height={statusRows}>
         <Text color={connected ? 'green' : 'yellow'}>
-          {connected ? '● connected' : '○ connecting…'}
+          {connected ? '● connected' : connecting ? '○ connecting…' : '○ idle'}
         </Text>
-        {lastError ? <Text color="red"> · {lastError}</Text> : null}
+        {lastError ? <Text color="red"> · {lastError.message}</Text> : null}
       </Box>
       <Box borderStyle="round" borderColor="gray">
         <Text>{myName}: </Text>

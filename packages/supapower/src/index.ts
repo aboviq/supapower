@@ -6,6 +6,7 @@ import { asSupapowerError } from './errors.js';
 import { createSupapowerEvents, SupapowerErrorEvent, type SupapowerEventTarget } from './events.js';
 import { createLeadership } from './leadership.js';
 import { readLocalColumns, runMigrations, trackTables } from './migrations.js';
+import { trackStatus } from './status.js';
 import {
   reconcileUser,
   resolveTables,
@@ -204,9 +205,13 @@ export interface SupapowerExtension {
  */
 export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
   const events = createSupapowerEvents();
+  const status = trackStatus(events);
 
   return {
     events,
+    get status() {
+      return status.current;
+    },
     async sync({
       supabase,
       tables,
@@ -231,6 +236,7 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
           signal?.removeEventListener('abort', unsubscribe);
           stopLeadership?.();
           stopLeadership = undefined;
+          status.stopped();
         }
 
         await draining;
@@ -244,6 +250,7 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
         return handle;
       }
 
+      status.syncing();
       signal?.addEventListener('abort', unsubscribe, { once: true });
 
       // The schema has to exist in every tab, not just the one that ends up
@@ -268,6 +275,9 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
       }
 
       stopLeadership = leadership.subscribe((leaderSignal) => {
+        status.leading(true);
+        leaderSignal.addEventListener('abort', () => status.leading(false), { once: true });
+
         // Both directions run on the leader only: every tab shares one
         // database, so a second syncer would otherwise duplicate every write.
         const supervisor = superviseSync({

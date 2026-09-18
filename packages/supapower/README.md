@@ -433,6 +433,7 @@ const sync = await pg.supapower.sync({ supabase, tables: ['todos'] });
 | `connect`             | The realtime channel is subscribed and delivering changes                              |                |
 | `disconnect`          | The realtime channel stopped delivering changes                                        |                |
 | `error`               | Something went wrong but did not stop the sync - see [Error handling](#error-handling) |                |
+| `statusChange`        | The derived [`supapower.status`](#supapowerstatus) changed                             |                |
 
 `downloadTableStart`/`downloadTableFinish` fire once per table on every download, initial or
 catch-up alike; `downloadStart`/`downloadFinish` bracket the whole run. A download that fails
@@ -446,6 +447,44 @@ failure gets no `uploadFinish`; it is retried, and brackets its own attempt.
 `connect`/`disconnect` only fire on the tab holding leadership, and only on an actual transition -
 a channel that reports trouble more than once in a row without recovering does not get a
 `disconnect` for each report.
+
+### `supapower.status`
+
+A PowerSync-like snapshot of what the sync is doing, derived entirely from the events above. It
+exists as soon as `pg.supapower` does; nothing in it changes until `sync()` is called.
+
+```ts
+const sync = await pg.supapower.sync({ supabase, tables: ['todos'] });
+
+pg.supapower.events.addEventListener('statusChange', () => {
+  console.log(pg.supapower.status);
+});
+```
+
+| Field           | Type                          | Meaning                                                               |
+| --------------- | ----------------------------- | --------------------------------------------------------------------- |
+| `leading`       | `boolean`                     | This tab or process is the one running the sync                       |
+| `connected`     | `boolean`                     | The realtime channel is subscribed and delivering changes             |
+| `connecting`    | `boolean`                     | Leading and syncing, but not connected yet                            |
+| `downloading`   | `boolean`                     | A download (initial or catch-up) is in progress                       |
+| `uploading`     | `boolean`                     | A batch of local changes is uploading                                 |
+| `hasSynced`     | `boolean`                     | At least one full download has finished since `sync()` was called     |
+| `lastSyncedAt`  | `Date \| undefined`           | When the last full download finished                                  |
+| `downloadError` | `SupapowerError \| undefined` | The last download-side failure, cleared by the next finished download |
+| `uploadError`   | `SupapowerError \| undefined` | The last upload-side failure, cleared by the next finished upload     |
+
+Every value is a new frozen object - `pg.supapower.status` before and after a `statusChange` are
+never the same reference, which is what lets a React (or any other) subscriber treat it as an
+external store snapshot. Between events the same reference is returned every time.
+
+Each tab's status is entirely local: only the leader tab downloads, uploads and holds the realtime
+channel - see [Multi-tab behavior](#multi-tab-behavior) below - so every field, `hasSynced`
+included, stays `false` on a follower tab, even though its data keeps arriving through the shared
+database. Read `leading` before trusting the rest of the status, or build a status indicator around
+whichever tab is leading rather than the one your component happens to render in.
+
+React apps get this as a hook, `useSupapowerStatus()`, from
+[`@supapower/react`](https://github.com/aboviq/supapower/tree/main/packages/react#readme).
 
 ### Multi-tab behavior
 
@@ -582,14 +621,14 @@ indistinguishable from the client - the row is gone upstream, or you may not wri
 
 Everything needed for the common case is on the package root. The rest is split per module.
 
-| Import                 | Contains                                                                               |
-| ---------------------- | -------------------------------------------------------------------------------------- |
-| `supapower`            | `supapower` (the extension), `createSupapower`                                         |
-| `supapower/types`      | `SupapowerSyncOptions`, `SupapowerSync`, `SupapowerTableConfig`, `PGliteWithSupapower` |
-| `supapower/changes`    | `ChangeRow`, `UnrecoverableUploadError`, `SyncTransaction`                             |
-| `supapower/errors`     | `SupapowerError`, `SupapowerUploadError`, `asSupapowerError`, the guards and codes     |
-| `supapower/events`     | `SupapowerEventTarget`, `SupapowerErrorEvent`, `SupapowerTableEvent`                   |
-| `supapower/leadership` | `createLeadership` and the individual strategies                                       |
+| Import                 | Contains                                                                                                  |
+| ---------------------- | --------------------------------------------------------------------------------------------------------- |
+| `supapower`            | `supapower` (the extension), `createSupapower`                                                            |
+| `supapower/types`      | `SupapowerSyncOptions`, `SupapowerSync`, `SupapowerTableConfig`, `PGliteWithSupapower`, `SupapowerStatus` |
+| `supapower/changes`    | `ChangeRow`, `UnrecoverableUploadError`, `SyncTransaction`                                                |
+| `supapower/errors`     | `SupapowerError`, `SupapowerUploadError`, `asSupapowerError`, the guards and codes                        |
+| `supapower/events`     | `SupapowerEventTarget`, `SupapowerErrorEvent`, `SupapowerTableEvent`                                      |
+| `supapower/leadership` | `createLeadership` and the individual strategies                                                          |
 
 `createSupapower(pg)` is the same code path as the extension, for when registering an extension is
 not an option:

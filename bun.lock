@@ -20,8 +20,8 @@
       "version": "0.0.0",
       "dependencies": {
         "@electric-sql/pglite": "^0.5.8",
-        "@electric-sql/pglite-react": "^0.4.8",
         "@supabase/supabase-js": "^2.116.0",
+        "@supapower/react": "workspace:*",
         "ink": "^7.1.1",
         "ink-text-input": "^6.0.0",
         "react": "^19.3.0",
@@ -31,9 +31,27 @@
         "@types/react": "^19.3.0",
       },
     },
+    "packages/react": {
+      "name": "@supapower/react",
+      "version": "0.0.0",
+      "dependencies": {
+        "@electric-sql/pglite-react": "^0.4.8",
+      },
+      "devDependencies": {
+        "@electric-sql/pglite": "^0.5.8",
+        "@types/react": "^19.3.0",
+        "react": "^19.3.0",
+        "supapower": "workspace:*",
+      },
+      "peerDependencies": {
+        "@electric-sql/pglite": ">=0.5.0 <1.0.0",
+        "react": "^18.0.0 || ^19.0.0",
+        "supapower": ">=0.1.0 <1.0.0",
+      },
+    },
     "packages/supapower": {
       "name": "supapower",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "devDependencies": {
         "@electric-sql/pglite": "^0.5.8",
         "@supabase/supabase-js": "^2.116.0",
@@ -186,6 +204,8 @@
     "@supabase/storage-js": ["@supabase/storage-js@2.116.0", "", { "dependencies": { "iceberg-js": "^0.8.1", "tslib": "2.8.1" } }, "sha512-6/3hR6vccBP6oGM5B6RfbwZcTCKmQOodd/ZWQdsw8yJsU5zO/a//oBL6yLnmgxcjnHSrelW8rsO7hL5DPybyUQ=="],
 
     "@supabase/supabase-js": ["@supabase/supabase-js@2.116.0", "", { "dependencies": { "@supabase/auth-js": "2.116.0", "@supabase/functions-js": "2.116.0", "@supabase/postgrest-js": "2.116.0", "@supabase/realtime-js": "2.116.0", "@supabase/storage-js": "2.116.0" }, "peerDependencies": { "@opentelemetry/api": ">=1.0.0" }, "optionalPeers": ["@opentelemetry/api"] }, "sha512-YyWmKXt2NspV9iO8FPnlswUFJIRnrLd3oTCb+3ZyYRuKZtBH0xCUDgnUqoyA0fGUxpM/UhfwDjYf/dht/9bp7g=="],
+
+    "@supapower/react": ["@supapower/react@workspace:packages/react"],
 
     "@types/bun": ["@types/bun@1.4.2", "", { "dependencies": { "bun-types": "1.4.2" } }, "sha512-GimotNn7+ZV0uVArItBbriZsR1oNf0+WTzPkdcFrzShI7k2norL0uzEaJT8T33dWr7O/c9ZDuAFQrctKCi72oQ=="],
 

@@ -2,6 +2,7 @@ import type { PGliteInterface } from '@electric-sql/pglite';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import type { UnrecoverableUploadError } from './changes.js';
+import type { SupapowerError } from './errors.js';
 import type { SupapowerEventTarget } from './events.js';
 import type { LeadershipStrategy } from './leadership.js';
 
@@ -202,6 +203,34 @@ export interface SupapowerSync {
   unsubscribe(): Promise<void>;
 }
 
+/** A PowerSync-like snapshot of what the sync is doing, derived from the events. */
+export interface SupapowerStatus {
+  /**
+   * Whether this tab or process is the one running the sync.
+   *
+   * Only the leader downloads, uploads and holds the realtime channel, so every
+   * other field stays `false` in a follower tab - its data still arrives, through
+   * the shared database.
+   */
+  leading: boolean;
+  /** The realtime channel is subscribed and delivering changes. */
+  connected: boolean;
+  /** The sync is running and leading, but the channel is not delivering yet. */
+  connecting: boolean;
+  /** A download (initial or catch-up) is in progress. */
+  downloading: boolean;
+  /** A batch of local changes is uploading. */
+  uploading: boolean;
+  /** At least one full download has finished since `sync()` was called. */
+  hasSynced: boolean;
+  /** When the last full download finished. */
+  lastSyncedAt: Date | undefined;
+  /** The last download-side failure, cleared by the next finished download. */
+  downloadError: SupapowerError | undefined;
+  /** The last upload-side failure, cleared by the next finished upload. */
+  uploadError: SupapowerError | undefined;
+}
+
 export interface SupapowerNamespace {
   /**
    * Events dispatched during the sync: `downloadStart`, `downloadFinish`,
@@ -213,6 +242,15 @@ export interface SupapowerNamespace {
    * `sync()` is ever called - nothing is dispatched until it is.
    */
   readonly events: SupapowerEventTarget;
+
+  /**
+   * The current sync status, derived from the events below.
+   *
+   * A getter which returns a new frozen object every time something changes, and a `statusChange`
+   * event is dispatched on {@link SupapowerNamespace.events} with it. Exists
+   * as soon as the namespace does; nothing changes until `sync()` is called.
+   */
+  readonly status: SupapowerStatus;
 
   /**
    * Initializes the local database and starts syncing with the remote tables based on the provided options.

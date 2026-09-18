@@ -11,8 +11,8 @@
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.8",
-    "@electric-sql/pglite-react": "^0.4.8",
     "@supabase/supabase-js": "^2.116.0",
+    "@supapower/react": "workspace:*",
     "ink": "^7.1.1",
     "ink-text-input": "^6.0.0",
     "react": "^19.3.0",

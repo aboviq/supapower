@@ -1,0 +1,66 @@
+{
+  "name": "@supapower/react",
+  "version": "0.0.0",
+  "description": "React hooks for Supapower: PGlite live queries plus sync status",
+  "keywords": [
+    "local-first",
+    "pglite",
+    "react",
+    "supabase",
+    "supapower",
+    "sync"
+  ],
+  "homepage": "https://github.com/aboviq/supapower/tree/main/packages/react#readme",
+  "bugs": {
+    "url": "https://github.com/aboviq/supapower/issues"
+  },
+  "license": "Apache-2.0",
+  "author": "Aboviq AB",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aboviq/supapower.git",
+    "directory": "packages/react"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "dependencies": {
+    "@electric-sql/pglite-react": "^0.4.8"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "@types/react": "^19.3.0",
+    "react": "^19.3.0",
+    "supapower": "workspace:*"
+  },
+  "peerDependencies": {
+    "@electric-sql/pglite": ">=0.5.0 <1.0.0",
+    "react": "^18.0.0 || ^19.0.0",
+    "supapower": ">=0.1.0 <1.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

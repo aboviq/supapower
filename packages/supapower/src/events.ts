@@ -60,6 +60,8 @@ export interface SupapowerEventMap {
   disconnect: Event;
   /** Something went wrong that did not stop the sync. */
   error: SupapowerErrorEvent;
+  /** The derived `supapower.status` changed. */
+  statusChange: Event;
 }
 
 /** An `EventTarget` typed for {@link SupapowerEventMap}. */
