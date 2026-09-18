@@ -1,6 +1,6 @@
 {
   "name": "supapower",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "A sync engine keeping a local PGlite database in sync with Supabase - inspired by PowerSync",
   "keywords": [
     "local-first",
