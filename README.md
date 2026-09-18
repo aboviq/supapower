@@ -26,9 +26,10 @@ Everything below, except the [examples section](#examples), is for working with 
 
 ## Examples
 
-| Example                   | Description                                                             |
-| ------------------------- | ----------------------------------------------------------------------- |
-| [`chat`](./example/chat/) | A terminal chat app, showing a two-way sync between Supabase and PGlite |
+| Example                           | Description                                                                                          |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| [`chat`](./example/chat/)         | A terminal chat app, showing a two-way sync between Supabase and PGlite                              |
+| [`vue-chat`](./example/vue-chat/) | A browser chat app, showing PGlite's multi-tab worker and a two-way sync between Supabase and PGlite |
 
 ## Requirements
 

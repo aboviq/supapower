@@ -1,4 +1,4 @@
 {
-  "*.{js,mjs,cjs,jsx,ts,mts,cts,tsx}": ["oxlint --fix --max-warnings=0", "oxfmt"],
+  "*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue}": ["oxlint --fix --max-warnings=0", "oxfmt"],
   "*.{json,jsonc,md,yml,yaml,css,html}": ["oxfmt"]
 }
