@@ -64,12 +64,12 @@
       "peerDependencies": {
         "@electric-sql/pglite": ">=0.5.0 <1.0.0",
         "react": "^18.0.0 || ^19.0.0",
-        "supapower": ">=0.2.0",
+        "supapower": ">=0.3.0",
       },
     },
     "packages/supapower": {
       "name": "supapower",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "devDependencies": {
         "@electric-sql/pglite": "^0.5.8",
         "@supabase/supabase-js": "^2.116.0",
@@ -81,7 +81,7 @@
     },
     "packages/vue": {
       "name": "@supapower/vue",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@electric-sql/pglite-vue": "^0.4.8",
       },
@@ -92,13 +92,13 @@
       },
       "peerDependencies": {
         "@electric-sql/pglite": ">=0.5.0 <1.0.0",
-        "supapower": ">=0.1.0 <1.0.0",
+        "supapower": ">=0.3.0",
         "vue": "^3.3.0",
       },
     },
     "packages/worker": {
       "name": "@supapower/worker",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "devDependencies": {
         "@electric-sql/pglite": "^0.5.8",
       },
