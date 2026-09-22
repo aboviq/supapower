@@ -148,6 +148,22 @@ export interface SupapowerSyncOptions {
    */
   scope?: string;
   /**
+   * How long a table's last completed download stays fresh, in milliseconds.
+   *
+   * Leadership follows tab visibility, so switching to another tab starts a
+   * fresh syncer - and a table without a `cursor` is downloaded whole each time
+   * one starts. A table that finished downloading more recently than this is
+   * skipped instead; `0` turns the throttle off and downloads everything every
+   * time.
+   *
+   * Two things ignore it, because neither is a repeat of work already done: the
+   * catch-up after a dropped realtime connection, and a table whose configured
+   * cursor or local columns have changed since it was last downloaded.
+   *
+   * @default 60_000
+   */
+  downloadThrottle?: number;
+  /**
    * Decides what happens to a batch of local changes that Supabase rejects for
    * a reason retrying cannot fix - a data type mismatch, a constraint
    * violation, or a row-level security denial.

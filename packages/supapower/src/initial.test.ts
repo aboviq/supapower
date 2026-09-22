@@ -129,6 +129,153 @@ describe('runInitialSync', () => {
   });
 });
 
+describe('runInitialSync - throttling repeated downloads', () => {
+  test('skips a table whose last download is still fresh', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase();
+
+    pg.metadata.set('TableSyncState', {
+      '"public"."todos"': { downloadedAt: Date.now(), columns: ['id', 'title'] },
+    });
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: live(),
+    });
+
+    expect(supabase.calls).toEqual(['select:plans']);
+  });
+
+  test('downloads a table again once its record has aged past the throttle', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase();
+
+    pg.metadata.set('TableSyncState', {
+      '"public"."todos"': { downloadedAt: Date.now() - 120_000, columns: ['id', 'title'] },
+    });
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: live(),
+    });
+
+    expect(supabase.calls).toEqual(['select:todos', 'select:plans']);
+  });
+
+  test('downloads a table anyway when a column was added locally since', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase();
+
+    pg.metadata.set('TableSyncState', {
+      '"public"."todos"': { downloadedAt: Date.now(), columns: ['id'] },
+    });
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: live(),
+    });
+
+    expect(supabase.calls).toEqual(['select:todos', 'select:plans']);
+  });
+
+  test('a second pass over the same database repeats no download', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase();
+
+    const run = () =>
+      runInitialSync({
+        pg: asPGlite(pg),
+        supabase: asSupabaseClient(supabase),
+        tables,
+        signal: live(),
+      });
+
+    await run();
+    await run();
+
+    expect(supabase.calls).toEqual(['select:todos', 'select:plans']);
+  });
+
+  test('downloadThrottle: 0 downloads every table regardless of freshness', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase();
+
+    pg.metadata.set('TableSyncState', {
+      '"public"."todos"': { downloadedAt: Date.now(), columns: ['id', 'title'] },
+    });
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: live(),
+      downloadThrottle: 0,
+    });
+
+    expect(supabase.calls).toEqual(['select:todos', 'select:plans']);
+  });
+
+  test('dispatches downloadStart/downloadFinish but no per-table events when every table is fresh', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase();
+    const events = createSupapowerEvents();
+    const seen: string[] = [];
+
+    pg.metadata.set('TableSyncState', {
+      '"public"."todos"': { downloadedAt: Date.now(), columns: ['id', 'title'] },
+      '"public"."plans"': { downloadedAt: Date.now(), columns: ['id'] },
+    });
+
+    events.addEventListener('downloadStart', () => seen.push('downloadStart'));
+    events.addEventListener('downloadTableStart', (event) =>
+      seen.push(`start:${event.config.table}`),
+    );
+    events.addEventListener('downloadTableFinish', (event) =>
+      seen.push(`finish:${event.config.table}`),
+    );
+    events.addEventListener('downloadFinish', () => seen.push('downloadFinish'));
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: live(),
+      events,
+    });
+
+    expect(seen).toEqual(['downloadStart', 'downloadFinish']);
+    expect(supabase.calls).toEqual([]);
+  });
+
+  test('a failed download does not become fresh', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase({
+      downloadError: (table) => (table === 'todos' ? { code: '42501', message: 'denied' } : null),
+    });
+
+    await expect(
+      runInitialSync({
+        pg: asPGlite(pg),
+        supabase: asSupabaseClient(supabase),
+        tables,
+        signal: live(),
+      }),
+    ).rejects.toThrow('Could not download "public"."todos" from Supabase');
+
+    expect(
+      (pg.metadata.get('TableSyncState') as Record<string, unknown> | undefined)?.[
+        '"public"."todos"'
+      ],
+    ).toBeUndefined();
+  });
+});
+
 describe('reconcileUser', () => {
   test('truncates the authenticated tables when the user changes', async () => {
     const pg = createFakePGlite();
@@ -171,15 +318,20 @@ describe('reconcileUser', () => {
 
     await reconcileUser(asPGlite(pg), tables, 'user-a');
 
-    pg.metadata.set('SyncedCursorAt', {
-      '"public"."todos"': { at: '2026-01-01T00:00:00.000Z', cursor: 'updated_at', columns: ['id'] },
-      '"public"."plans"': { at: 'x', cursor: 'updated_at', columns: ['id'] },
+    pg.metadata.set('TableSyncState', {
+      '"public"."todos"': {
+        at: '2026-01-01T00:00:00.000Z',
+        cursor: 'updated_at',
+        columns: ['id'],
+        downloadedAt: 0,
+      },
+      '"public"."plans"': { at: 'x', cursor: 'updated_at', columns: ['id'], downloadedAt: 0 },
     });
 
     await reconcileUser(asPGlite(pg), tables, null);
 
     // "plans" is anon, so it is neither emptied nor forgotten.
-    expect(Object.keys(pg.metadata.get('SyncedCursorAt') as object)).toEqual(['"public"."plans"']);
+    expect(Object.keys(pg.metadata.get('TableSyncState') as object)).toEqual(['"public"."plans"']);
   });
 
   test('treats a database that was never synced as nothing to clear', async () => {
@@ -230,12 +382,14 @@ describe('runInitialSync - incremental with a cursor', () => {
     });
 
     expect(supabase.calls).toEqual(['select:todos', 'select:todos', 'select:plans']);
-    expect(pg.metadata.get('SyncedCursorAt')).toEqual({
+    expect(pg.metadata.get('TableSyncState')).toEqual({
       '"public"."todos"': {
         at: '2026-01-01T12:00:00.000Z',
         cursor: 'updated_at',
         columns: ['id', 'updated_at'],
+        downloadedAt: expect.any(Number),
       },
+      '"public"."plans"': { columns: ['id'], downloadedAt: expect.any(Number) },
     });
   });
 
@@ -249,6 +403,7 @@ describe('runInitialSync - incremental with a cursor', () => {
         supabase: asSupabaseClient(supabase),
         tables: incremental,
         signal: live(),
+        downloadThrottle: 0,
       });
 
     await run();
@@ -274,6 +429,7 @@ describe('runInitialSync - incremental with a cursor', () => {
       supabase: asSupabaseClient(supabase),
       tables: incremental,
       signal: live(),
+      downloadThrottle: 0,
     });
 
     const insertsOfTodos = () =>
@@ -287,6 +443,7 @@ describe('runInitialSync - incremental with a cursor', () => {
       supabase: asSupabaseClient(supabase),
       tables: incremental,
       signal: live(),
+      downloadThrottle: 0,
     });
 
     // The 12:00 row comes back: the margin covers a transaction that stamped
@@ -302,6 +459,7 @@ describe('runInitialSync - incremental with a cursor', () => {
       supabase: asSupabaseClient(createFakeSupabase({ rows })),
       tables: incremental,
       signal: live(),
+      downloadThrottle: 0,
     });
 
     // As if the newest row had been hard deleted upstream.
@@ -314,9 +472,10 @@ describe('runInitialSync - incremental with a cursor', () => {
       ),
       tables: incremental,
       signal: live(),
+      downloadThrottle: 0,
     });
 
-    expect(pg.metadata.get('SyncedCursorAt')).toMatchObject({
+    expect(pg.metadata.get('TableSyncState')).toMatchObject({
       '"public"."todos"': { at: '2026-01-01T12:00:00.000Z' },
     });
   });
@@ -330,6 +489,7 @@ describe('runInitialSync - incremental with a cursor', () => {
       supabase: asSupabaseClient(supabase),
       tables: incremental,
       signal: live(),
+      downloadThrottle: 0,
     });
 
     await runInitialSync({
@@ -337,6 +497,7 @@ describe('runInitialSync - incremental with a cursor', () => {
       supabase: asSupabaseClient(supabase),
       tables: incremental,
       signal: live(),
+      downloadThrottle: 0,
     });
 
     expect(supabase.calls.filter((call) => call.startsWith('select:todos'))).toEqual([
@@ -359,7 +520,7 @@ describe('runInitialSync - incremental with a cursor', () => {
 
     await reconcileUser(asPGlite(pg), incremental, 'user-a');
 
-    expect(pg.metadata.get('SyncedCursorAt')).toEqual({});
+    expect(Object.keys(pg.metadata.get('TableSyncState') as object)).toEqual(['"public"."plans"']);
   });
 });
 
@@ -434,6 +595,7 @@ describe('runInitialSync - schema drift', () => {
         supabase: asSupabaseClient(supabase),
         tables: configs,
         signal: live(),
+        downloadThrottle: 0,
       });
 
     await run(
@@ -500,11 +662,12 @@ describe('runInitialSync - pagination', () => {
     });
 
     expect(applied(pg)).toHaveLength(2500);
-    expect(pg.metadata.get('SyncedCursorAt')).toEqual({
+    expect(pg.metadata.get('TableSyncState')).toEqual({
       '"public"."todos"': {
         at: rows.at(-1)?.updated_at,
         cursor: 'updated_at',
         columns: ['id', 'updated_at'],
+        downloadedAt: expect.any(Number),
       },
     });
     // Three full pages plus the empty page that ends the loop.
@@ -540,7 +703,7 @@ describe('runInitialSync - pagination', () => {
 
     await expect(failing).rejects.toThrow('Could not download "public"."todos" from Supabase');
 
-    const watermark = pg.metadata.get('SyncedCursorAt') as Record<string, unknown> | undefined;
+    const watermark = pg.metadata.get('TableSyncState') as Record<string, unknown> | undefined;
 
     expect(watermark?.['"public"."todos"']).toBeUndefined();
   });
@@ -583,7 +746,7 @@ describe('runInitialSync - tables outside "public"', () => {
       signal: live(),
     });
 
-    const inserts = pg.statements.filter((statement) => statement.startsWith('INSERT INTO'));
+    const inserts = pg.statements.filter((statement) => statement.startsWith('INSERT INTO "'));
 
     expect(inserts[0]).toContain('INSERT INTO "app"."todos"');
     // Downloaded from "app" upstream, but it lives in "mirror" here.
@@ -606,7 +769,7 @@ describe('runInitialSync - tables outside "public"', () => {
       signal: live(),
     });
 
-    expect(Object.keys(pg.metadata.get('SyncedCursorAt') as object)).toEqual(['"mirror"."notes"']);
+    expect(Object.keys(pg.metadata.get('TableSyncState') as object)).toEqual(['"mirror"."notes"']);
   });
 });
 

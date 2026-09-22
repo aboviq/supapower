@@ -193,6 +193,16 @@ interface SupapowerSyncOptions {
    */
   scope?: string;
   /**
+   * How long a table's last completed download stays fresh, in milliseconds.
+   *
+   * A table that finished downloading more recently than this is skipped
+   * instead of being pulled again; `0` downloads every table every time. A
+   * changed `cursor` or local column set bypasses this and downloads anyway.
+   *
+   * @default 60000
+   */
+  downloadThrottle?: number;
+  /**
    * Decides what happens to a batch Supabase rejects for good.
    *
    * @default Discards the batch.
@@ -206,7 +216,7 @@ For tables provided as a `string`, they are expected to have a primary key colum
 The initial sync is performed in the specified order of the tables provided in the `tables` array.
 
 > [!NOTE]
-> The initial sync asks only for the columns this client's schema has, upserts whole rows on the primary key - which makes re-running it harmless - and never deletes. A row hard deleted remotely while this client was away only disappears locally on the next truncation (e.g. on user change or sign out). Configure [`cursor`](#table-cursor-configuration) to make it ask for only what changed; without it, every start pulls the whole table.
+> The initial sync asks only for the columns this client's schema has, upserts whole rows on the primary key - which makes re-running it harmless - and never deletes. A row hard deleted remotely while this client was away only disappears locally on the next truncation (e.g. on user change or sign out). Configure [`cursor`](#table-cursor-configuration) to make it ask for only what changed; without it, every start pulls the whole table - throttled to once per `downloadThrottle` (see above), so a changed `cursor` or local column set is the exception that always downloads again immediately.
 
 ##### Conflicts
 
@@ -524,6 +534,10 @@ released by the browser when the tab closes or crashes, and a visible tab gives 
 it is hidden. A hidden tab never drains the queue - browsers throttle or freeze timers in hidden
 tabs, so a hidden leader would stall the queue for every tab - and no tab drains while every tab is
 hidden. Read `sync.leadership` to see which mechanism you ended up with.
+
+Leadership moving between tabs starts a fresh syncer each time, but it does not mean a fresh
+download every time: `downloadThrottle` skips a table whose last download is still within the
+window, so switching tabs repeatedly inside that window re-downloads nothing.
 
 ### Error handling
 

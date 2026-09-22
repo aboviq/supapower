@@ -2,7 +2,7 @@ import type { PGliteInterface, Transaction } from '@electric-sql/pglite';
 
 const keys = {
   syncedUser: 'SyncedUser',
-  syncedCursorAt: 'SyncedCursorAt',
+  tableSyncState: 'TableSyncState',
 } as const;
 
 /**
@@ -40,49 +40,55 @@ export const setSyncedUser = async (
 };
 
 /**
- * How far a table has been downloaded, and what that is worth.
+ * What is known about the last completed download of one table.
  *
- * A bare value would be underspecified. It only means anything next to the
- * column it was read from and the columns the download asked for: change
- * either and the same timestamp answers a different question.
+ * Written for every table, whether or not it has a cursor: even with nothing
+ * to page from, when the download finished decides whether the next start has
+ * to repeat it. The cursor half only means anything next to the column it was
+ * read from and the columns the download asked for - change either and the
+ * same record answers a different question, which is what `stillApplies`
+ * checks before either half is trusted.
  */
-export interface CursorWatermark {
-  /** The highest value seen in the cursor column. */
-  at: string;
-  /** The column that value was read from. */
-  cursor: string;
+export interface TableSyncState {
+  /** When the download finished, as local epoch milliseconds. */
+  downloadedAt: number;
   /** The columns the download asked for, sorted. */
   columns: string[];
+  /** The cursor column the table was downloaded with, if it has one. */
+  cursor?: string;
+  /** The highest value seen in that cursor column. */
+  at?: string;
 }
 
 /**
- * How far a table has been downloaded, or `null` if it never has.
+ * What is known about the last completed download of a table, or `null` if
+ * it has never completed one.
  *
  * The value comes straight out of the remote table, so it is only ever
- * comparable to itself - see {@link CursorWatermark}.
+ * comparable to itself - see {@link TableSyncState}.
  *
  * @param table The table's qualified local name, e.g. `public.todos`.
  */
-export const getSyncedCursorAt = async (
+export const getTableSyncState = async (
   pg: PGliteInterface | Transaction,
   table: string,
-): Promise<CursorWatermark | null> => {
-  const { rows } = await pg.sql<{ value: Record<string, CursorWatermark> | null }>`
-    SELECT value FROM supapower.metadata WHERE key = ${keys.syncedCursorAt}
+): Promise<TableSyncState | null> => {
+  const { rows } = await pg.sql<{ value: Record<string, TableSyncState> | null }>`
+    SELECT value FROM supapower.metadata WHERE key = ${keys.tableSyncState}
   `;
 
   return rows[0]?.value?.[table] ?? null;
 };
 
 /**
- * Records how far a table has been downloaded, and under what.
+ * Records what is known about the last completed download of a table.
  *
  * @param table The table's qualified local name, e.g. `public.todos`.
  */
-export const setSyncedCursorAt = async (
+export const setTableSyncState = async (
   pg: PGliteInterface | Transaction,
   table: string,
-  watermark: CursorWatermark,
+  state: TableSyncState,
 ): Promise<void> => {
   await pg.sql`
     INSERT INTO supapower.metadata (
@@ -90,8 +96,8 @@ export const setSyncedCursorAt = async (
       value
     )
     VALUES (
-      ${keys.syncedCursorAt},
-      ${JSON.stringify({ [table]: watermark })}
+      ${keys.tableSyncState},
+      ${JSON.stringify({ [table]: state })}
     )
     ON CONFLICT (key) DO UPDATE SET
       value = metadata.value || EXCLUDED.value;
@@ -99,11 +105,12 @@ export const setSyncedCursorAt = async (
 };
 
 /**
- * Forgets how far tables were downloaded, so the next start pulls them whole.
+ * Forgets what was known about tables' last downloads, so the next start
+ * pulls them whole.
  *
  * @param tables The tables' qualified local names, e.g. `public.todos`.
  */
-export const clearSyncedCursorAt = async (
+export const clearTableSyncState = async (
   pg: PGliteInterface | Transaction,
   tables: string[],
 ): Promise<void> => {
@@ -114,6 +121,6 @@ export const clearSyncedCursorAt = async (
   await pg.sql`
     UPDATE supapower.metadata
     SET value = value - ${tables}::text[]
-    WHERE key = ${keys.syncedCursorAt}
+    WHERE key = ${keys.tableSyncState}
   `;
 };

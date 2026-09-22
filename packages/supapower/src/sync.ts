@@ -31,12 +31,12 @@ import {
   type SupapowerEventTarget,
 } from './events.js';
 import {
-  clearSyncedCursorAt,
-  type CursorWatermark,
-  getSyncedCursorAt,
+  clearTableSyncState,
   getSyncedUser,
-  setSyncedCursorAt,
+  getTableSyncState,
   setSyncedUser,
+  setTableSyncState,
+  type TableSyncState,
 } from './metadata.js';
 import type { ResolvedTableConfig, SupapowerSyncedTable, SupapowerTableConfig } from './types.js';
 import { escapeIdentifier, executeInTransaction } from './utils.js';
@@ -58,6 +58,9 @@ const RETRY_MAX_MS = 60_000;
  * downloaded whole again.
  */
 const CURSOR_MARGIN_MS = 60_000;
+
+/** How long a completed download of a table counts as fresh. */
+const DOWNLOAD_THROTTLE_MS = 60_000;
 
 /** Supabase's default PostgREST `max-rows` cap per request. */
 const DOWNLOAD_PAGE_SIZE = 1_000;
@@ -601,7 +604,7 @@ export async function reconcileUser(
       `;
     }
 
-    await clearSyncedCursorAt(tx, toClearCursorFor);
+    await clearTableSyncState(tx, toClearCursorFor);
 
     await setSyncedUser(tx, user);
 
@@ -640,44 +643,70 @@ function selectable(column: string): string {
  * wanted now are ones it already covered.
  */
 function stillApplies(
-  watermark: CursorWatermark | null,
+  state: TableSyncState | null,
   config: SupapowerSyncedTable,
-): watermark is CursorWatermark {
+): state is TableSyncState {
   return (
-    watermark !== null
-    && watermark.cursor === config.cursor
-    && config.columns.every((column) => watermark.columns.includes(column))
+    state !== null
+    && state.cursor === config.cursor
+    && config.columns.every((column) => state.columns.includes(column))
   );
 }
 
-async function downloadTable(
-  pg: PGliteInterface,
-  supabase: SupabaseClient,
-  config: SupapowerSyncedTable,
-  signal: AbortSignal,
-  events: SupapowerEventTarget,
-): Promise<void> {
+interface DownloadTableOptions {
+  pg: PGliteInterface;
+  supabase: SupabaseClient;
+  config: SupapowerSyncedTable;
+  signal: AbortSignal;
+  events: SupapowerEventTarget;
+  /** How long the last completed download of this table counts as fresh. */
+  throttle: number;
+}
+
+async function downloadTable({
+  pg,
+  supabase,
+  config,
+  signal,
+  events,
+  throttle,
+}: DownloadTableOptions): Promise<void> {
   const { cursor, columns, primaryKey } = config;
   const name = localName(config);
+
+  const stored = await getTableSyncState(pg, name);
+  const previous = stillApplies(stored, config) ? stored : null;
+  const age = previous ? Date.now() - previous.downloadedAt : Number.NaN;
+
+  // A download that still answers this configuration and finished inside the
+  // window is not worth repeating - leadership moves between tabs on every
+  // switch, and each move would otherwise pull every table whole again. A
+  // clock that jumped backwards leaves a timestamp in the future, which counts
+  // as stale rather than freezing the table until the clock catches up.
+  if (age >= 0 && age < throttle) {
+    return;
+  }
+
   events.dispatchEvent(new SupapowerTableEvent('downloadTableStart', config));
 
   // Taken before the request so a change made while it is in flight is dated
   // after the snapshot rather than swallowed by it.
   const snapshotAt = new Date().toISOString();
 
-  const stored = cursor ? await getSyncedCursorAt(pg, name) : null;
-  const since = stillApplies(stored, config) ? Date.parse(stored.at) : Number.NaN;
+  const since = previous?.at === undefined ? Number.NaN : Date.parse(previous.at);
 
   // Where an incremental download starts: {@link CURSOR_MARGIN_MS} further back
   // than the last value seen. A watermark that is not a timestamp gives up and
   // pulls the whole table rather than guessing at how to step back from it.
   const from = Number.isNaN(since) ? null : new Date(since - CURSOR_MARGIN_MS).toISOString();
 
-  let highest: string | null = null;
+  // Seeded with the value already stored, so the same comparison that finds the
+  // furthest along row also keeps the watermark moving only forwards - and so a
+  // download that returns nothing new writes the old value back instead of
+  // dropping it.
+  let highest: string | null = previous?.at ?? null;
 
-  // Seeded with the value already stored, so the same comparison that finds
-  // the furthest along row also keeps the watermark moving only forwards: a
-  // hard deleted row can drag the highest value in the table backwards, and
+  // A hard deleted row can drag the highest value in the table backwards, and
   // reaching further back next time is pointless.
   let highestAt = Number.isNaN(since) ? Number.NEGATIVE_INFINITY : since;
 
@@ -760,16 +789,19 @@ async function downloadTable(
     last = lastKey;
   }
 
-  // Written once, after the whole table has paged through: a watermark
-  // written mid-table would claim coverage of rows that ordering by primary
-  // key has not reached yet.
-  if (highest !== null && cursor !== undefined) {
-    const at = highest;
-
-    await pg.transaction(async (tx) => {
-      await setSyncedCursorAt(tx, name, { at, cursor, columns: [...columns] });
-    });
-  }
+  // Written once, after the whole table has paged through: a record written
+  // mid-table would claim coverage of rows that ordering by primary key has
+  // not reached yet. It must stay unconditional - every table gets a fresh
+  // record, not only ones with a cursor and rows that moved the watermark -
+  // and it must stay last: the early returns above (aborted signal, a row
+  // without a primary key) and a thrown download error are unfinished
+  // downloads that must not count as fresh.
+  await setTableSyncState(pg, name, {
+    downloadedAt: Date.now(),
+    columns: [...columns],
+    ...(cursor === undefined ? {} : { cursor }),
+    ...(highest === null ? {} : { at: highest }),
+  });
 
   events.dispatchEvent(new SupapowerTableEvent('downloadTableFinish', config));
 }
@@ -786,15 +818,25 @@ export interface InitialSyncOptions {
    * @default A fresh, unlistened `EventTarget`.
    */
   events?: SupapowerEventTarget;
+  /**
+   * How long a table's last completed download stays fresh, in milliseconds.
+   *
+   * A table that finished downloading more recently than this is skipped;
+   * `0` downloads every table on every pass.
+   *
+   * @default 60_000
+   */
+  downloadThrottle?: number;
 }
 
 /**
  * Downloads every row of every table and writes it into the local database.
  *
  * A table configured with a `cursor` column is only asked for rows at or after
- * the last value downloaded, less a margin; one without is pulled whole on
- * every start. Either way the rows go through the same path as a realtime
- * INSERT, so the upsert on the primary key makes re-running it harmless.
+ * the last value downloaded, less a margin; one without is pulled whole again
+ * once `downloadThrottle` has passed since it last finished. Either way the
+ * rows go through the same path as a realtime INSERT, so the upsert on the
+ * primary key makes re-running it harmless.
  *
  * It does not delete anything. A row that was hard deleted remotely while this
  * client was away still needs {@link reconcileUser} or a remote DELETE event to
@@ -806,6 +848,7 @@ export async function runInitialSync({
   tables,
   signal,
   events = createSupapowerEvents(),
+  downloadThrottle = DOWNLOAD_THROTTLE_MS,
 }: InitialSyncOptions): Promise<void> {
   events.dispatchEvent(new Event('downloadStart'));
 
@@ -814,7 +857,7 @@ export async function runInitialSync({
       return;
     }
 
-    await downloadTable(pg, supabase, config, signal, events);
+    await downloadTable({ pg, supabase, config, signal, events, throttle: downloadThrottle });
   }
 
   events.dispatchEvent(new Event('downloadFinish'));
@@ -842,6 +885,15 @@ export interface IncomingSyncOptions {
    * @default A fresh, unlistened `EventTarget`.
    */
   events?: SupapowerEventTarget;
+  /**
+   * How long a table's last completed download stays fresh, in milliseconds.
+   *
+   * Applies to the download that starts the session. The catch-up download
+   * after a dropped channel ignores it.
+   *
+   * @default 60_000
+   */
+  downloadThrottle?: number;
 }
 
 /**
@@ -873,6 +925,7 @@ export async function runIncomingSync({
   signal,
   channel = `supapower:incoming:${crypto.randomUUID()}`,
   events = createSupapowerEvents(),
+  downloadThrottle = DOWNLOAD_THROTTLE_MS,
 }: IncomingSyncOptions): Promise<void> {
   if (signal.aborted || tables.size === 0) {
     return; // nothing this user is allowed to see
@@ -965,7 +1018,7 @@ export async function runIncomingSync({
   // every call site can fire it without awaiting.
   let downloading = false;
 
-  const download = async (): Promise<void> => {
+  const download = async (force = false): Promise<void> => {
     if (downloading) {
       return;
     }
@@ -974,7 +1027,18 @@ export async function runIncomingSync({
 
     try {
       for (let attempt = 0; !signal.aborted; attempt += 1) {
-        if (await enqueue(() => runInitialSync({ pg, supabase, tables, signal, events }))) {
+        if (
+          await enqueue(() =>
+            runInitialSync({
+              pg,
+              supabase,
+              tables,
+              signal,
+              events,
+              downloadThrottle: force ? 0 : downloadThrottle,
+            }),
+          )
+        ) {
           return;
         }
 
@@ -1010,7 +1074,9 @@ export async function runIncomingSync({
 
         if (missedChanges) {
           missedChanges = false;
-          download();
+          // Realtime replays nothing, so the outage gap is exactly the data
+          // this client is missing; throttling it away would strand those rows.
+          download(true);
         }
 
         return;

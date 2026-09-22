@@ -356,6 +356,44 @@ describe('runIncomingSync - catching up after a dropped channel', () => {
     controller.abort();
     await running;
   });
+
+  test('leaves the download throttled across two sessions on one database', async () => {
+    const pg = asPGlite(createFakePGlite());
+    const supabase = createFakeSupabase();
+    const first = new AbortController();
+
+    const firstSession = runIncomingSync({
+      pg,
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: first.signal,
+    });
+
+    expect(await waitFor(() => supabase.calls.includes('select:tags'))).toBe(true);
+
+    first.abort();
+    await firstSession;
+
+    const before = supabase.calls.length;
+    const second = new AbortController();
+
+    // The new session's leader is a different tab, but the download it starts
+    // with is the same download that just finished - the case this option
+    // exists for.
+    const secondSession = runIncomingSync({
+      pg,
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: second.signal,
+    });
+
+    await settle();
+
+    expect(supabase.calls).toHaveLength(before);
+
+    second.abort();
+    await secondSession;
+  });
 });
 
 describe('runIncomingSync - retrying a failed download', () => {

@@ -65,6 +65,7 @@ interface SyncSupervisorOptions {
   signal: AbortSignal;
   events: SupapowerEventTarget;
   onUnrecoverableError?: (context: UnrecoverableUploadError) => void | Promise<void>;
+  downloadThrottle?: number;
 }
 
 /** The tables that are reachable for a given identity. */
@@ -108,6 +109,7 @@ function superviseSync({
   signal,
   events,
   onUnrecoverableError,
+  downloadThrottle,
 }: SyncSupervisorOptions): Promise<void> {
   let identity: AuthIdentity | undefined;
   let running: AbortController | undefined;
@@ -151,7 +153,14 @@ function superviseSync({
 
       await Promise.all([
         outgoing,
-        runIncomingSync({ pg, supabase, tables: reachable, signal: session, events }),
+        runIncomingSync({
+          pg,
+          supabase,
+          tables: reachable,
+          signal: session,
+          events,
+          ...(downloadThrottle === undefined ? {} : { downloadThrottle }),
+        }),
       ]);
     })().catch((error: unknown) => {
       // Reported, not thrown: this promise is what `unsubscribe()` hands back,
@@ -218,6 +227,7 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
       signal,
       scope = 'default',
       onUnrecoverableError,
+      downloadThrottle,
     }: SupapowerSyncOptions): Promise<SupapowerSync> {
       const leadership = createLeadership(scope);
 
@@ -287,6 +297,7 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
           signal: leaderSignal,
           events,
           ...(onUnrecoverableError ? { onUnrecoverableError } : {}),
+          ...(downloadThrottle === undefined ? {} : { downloadThrottle }),
         });
 
         draining = draining.then(() => supervisor);

@@ -178,6 +178,12 @@ export const runMigrations = async (pg: PGliteInterface): Promise<void> => {
         value JSONB NOT NULL
       );
     `;
+
+    // The pre-rename record; its watermarks do not carry the download timestamp
+    // the throttle needs, so they are discarded rather than migrated.
+    await tx.sql`
+      DELETE FROM supapower.metadata WHERE key = 'SyncedCursorAt';
+    `;
   });
 };
 
