@@ -5,6 +5,8 @@ every hook from [`@electric-sql/pglite-react`](https://pglite.dev/docs/framework
 ready-made `extensions` object covering both PGlite extensions a Supapower app needs, and
 `useSupapowerStatus()` - a PowerSync-like sync status that re-renders your component as it changes.
 
+> **Status:** Below 1.0.0. The public API may still change.
+
 ## Installation
 
 ```bash

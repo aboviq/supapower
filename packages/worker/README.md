@@ -8,6 +8,8 @@ automatic fallback for browsers without `SharedWorker` (or where it fails to sta
 PGlite - [Supapower](https://github.com/aboviq/supapower/tree/main/packages/supapower#readme) is not
 required.
 
+> **Status:** Below 1.0.0. The public API may still change.
+
 ## Installation
 
 ```bash

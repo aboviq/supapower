@@ -104,8 +104,8 @@ app - that is expected until the credentials and the table above are both in pla
 
 - **In-memory only.** `PGlite.create()` is called without a `dataDir` or `fs`, so every start begins
   with an empty local database - that's what makes it easy to see the initial sync bring history back
-  from Supabase. A real app would persist locally (`NodeFS`/`IdbFs`, see the
-  [main README](../../packages/supapower/README.md#2-set-up-pglite)).
+  from Supabase. A real app would persist locally (`NodeFS`/`IdbFs`, see
+  [Persistent storage](../../packages/supapower/README.md#persistent-storage) in the main README).
 - **No authentication.** A fresh [UUIDv7](https://bun.sh/reference/bun/randomUUIDv7) is generated as
   the user id on every start instead of signing in through `supabase.auth`, so the RLS policies above
   have to allow anonymous access. Do not use this table's policies as-is on anything but a throwaway

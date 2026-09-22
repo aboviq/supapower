@@ -9,7 +9,7 @@
 The core for [Supapower](https://github.com/aboviq/supapower), a sync engine that keeps a
 local PGlite database in sync with Supabase inspired by PowerSync.
 
-> **Status:** 0.1.0. Both directions of the sync work; the public API may still change before 1.0.
+> **Status:** Below 1.0.0. Both directions of the sync work; the public API may still change.
 
 ## How it works?
 
@@ -35,7 +35,7 @@ npm install supapower @electric-sql/pglite @supabase/supabase-js
 
 (of course, you can use the package manager of your choice, e.g. `bun` or `pnpm`)
 
-## Usage
+## Quick Start
 
 ### 1. Set up your Supabase client
 
@@ -50,87 +50,22 @@ import { createClient } from '@supabase/supabase-js';
 export const supabase = createClient('https://xyzcompany.supabase.co', 'your-publishable-key');
 ```
 
-### 2. Set up PGlite
-
-> [!TIP]
-> Not in a browser environment? Skip to the next step and use Supapower directly with `PGlite.create`, e.g. in a Node.js, Bun or Deno environment.
-
-In a browser environment, follow [PGlite's Multi-tab Worker setup instructions](https://pglite.dev/docs/multi-tab-worker) and use the IndexedDB VFS which is recommended at the moment.
-
-This will give you two more files: `pglite-worker.ts` and `pglite.ts`:
-
-```ts
-// ./pglite-worker.ts
-import { PGlite, IdbFs } from '@electric-sql/pglite';
-import { worker } from '@electric-sql/pglite/worker';
-
-worker({
-  async init() {
-    const pg = new PGlite({
-      fs: new IdbFs('your-app'),
-      relaxedDurability: true,
-    });
-
-    // Preferable run any database migrations here...
-
-    return pg;
-  },
-});
-```
-
-> [!NOTE]
-> there are a few recommendations regarding how you create your database tables, see [database migrations](#database-migrations) below.
+### 2. Set up PGlite with the Supapower extension
 
 ```ts
 // ./pglite.ts
-import { PGliteWorker } from '@electric-sql/pglite/worker';
-
-export const pg = await PGliteWorker.create(
-  new Worker(new URL('./pglite-worker.ts', import.meta.url), {
-    type: 'module',
-  }),
-);
-```
-
-### 3. Add the Supapower extension to PGlite
-
-Modify your PGlite client configuration to enable the Supapower extension:
-
-#### In a browser environment
-
-```diff
-// ./pglite.ts
-import { PGliteWorker } from '@electric-sql/pglite/worker';
-+ import { supapower } from 'supapower';
-
-export const pg = await PGliteWorker.create(
-  new Worker(new URL('./pglite-worker.ts', import.meta.url), {
-    type: 'module',
-  }),
-+ {
-+   extensions: {
-+     supapower,
-+   },
-+ },
-);
-```
-
-#### In a non-browser environment (Node.js, Bun, Deno)
-
-```ts
-// ./pglite.ts
-import { PGlite, NodeFS } from '@electric-sql/pglite';
+import { PGlite } from '@electric-sql/pglite';
 import { supapower } from 'supapower';
 
 export const pg = await PGlite.create({
-  fs: new NodeFS('./path/to/datadir/'),
-  extensions: {
-    supapower,
-  },
+  extensions: { supapower },
 });
 ```
 
-### 4. Start the synchronization with Supabase
+This is the same call in a browser, Node.js, Bun or Deno - it's an in-memory database, so there's
+nothing further to set up yet.
+
+### 3. Start the synchronization with Supabase
 
 Use the [`supapower.sync`](#supapowersync) method to initiate the database and start the synchronization with Supabase:
 
@@ -147,7 +82,7 @@ const sync = await pg.supapower.sync({
 await sync.unsubscribe();
 ```
 
-### 5. Execute queries and profit
+### 4. Execute queries and profit
 
 To really see the full sync loop in action you can use the [Live Queries](https://pglite.dev/docs/live-queries) extension for PGlite and open your app in two browsers or add rows using Supabase Studio.
 
@@ -174,8 +109,34 @@ Do the same from a different browser or from Supabase Studio and notice the live
 
 **There you have it!**
 
-> [!NOTE]
-> A complete runnable app is in [`example/chat`](https://github.com/aboviq/supapower/tree/main/example/chat) - a terminal chat syncing two PGlite databases through Supabase.
+> [!IMPORTANT]
+> This in-memory database resets on every reload and isn't shared across tabs. Read
+> [Persistent storage](#persistent-storage) below before you ship a real app.
+
+> [!TIP]
+> Checkout the [`example/`](https://github.com/aboviq/supapower/tree/main/example/) folder for complete runnable example apps.
+
+## Persistent storage
+
+The Quick Start above uses an in-memory database - nothing survives a reload. To keep data across
+restarts, give PGlite a filesystem.
+
+In Node.js, Bun or Deno:
+
+```ts
+import { NodeFS, PGlite } from '@electric-sql/pglite';
+import { supapower } from 'supapower';
+
+export const pg = await PGlite.create({
+  fs: new NodeFS('./path/to/datadir/'),
+  extensions: { supapower },
+});
+```
+
+In a browser, do the same with `IdbFs` - but only from a worker, and never by opening a persistent
+`PGlite` instance directly from more than one tab. PGlite is a single-connection engine, and two tabs
+writing to the same files at once risks corrupting the database. See
+[Multi-tab behavior](#multi-tab-behavior) below for the safe way to set that up.
 
 ## API
 
@@ -491,6 +452,62 @@ React apps get this as a hook, `useSupapowerStatus()`, from
 Every tab that opens the same PGlite database shares one set of files, and therefore one
 `supapower.changes` queue. Exactly one tab may drain it, otherwise the same batch is pushed twice.
 
+#### Setting it up
+
+Opening a plain `PGlite` instance against the same `dataDir` from several tabs risks corrupting the
+database no matter what Supapower does with the queue - only ever touch the files from one process,
+using a worker.
+
+[`@supapower/worker`](https://github.com/aboviq/supapower/tree/main/packages/worker#readme) is the
+more stable option: one `SharedWorker` hosts the database for every tab instead of one tab owning it,
+falling back automatically to PGlite's own dedicated worker where `SharedWorker` isn't available.
+
+```ts
+// ./pglite-worker.ts
+import { worker } from '@supapower/worker/worker';
+import { IdbFs, PGlite } from '@electric-sql/pglite';
+
+worker({
+  async init() {
+    const pg = new PGlite({
+      fs: new IdbFs('your-app'),
+      relaxedDurability: true,
+    });
+
+    // Preferably run any database migrations here...
+
+    return pg;
+  },
+});
+```
+
+> [!NOTE]
+> There are a few recommendations regarding how you create your database tables, see
+> [database migrations](#database-migrations) below.
+
+```ts
+// ./pglite.ts
+import { createPGliteWorker } from '@supapower/worker';
+import { supapower } from 'supapower';
+
+export const pg = await createPGliteWorker(
+  {
+    shared: () =>
+      new SharedWorker(new URL('./pglite-worker.ts', import.meta.url), { type: 'module' }),
+    fallback: () => new Worker(new URL('./pglite-worker.ts', import.meta.url), { type: 'module' }),
+  },
+  { id: 'your-app', extensions: { supapower } },
+);
+```
+
+You can use [PGlite's own dedicated multi-tab worker](https://pglite.dev/docs/multi-tab-worker)
+instead if you'd rather not add the extra package - the setup is the same shape, just without the
+`SharedWorker` fallback, and `id` is optional rather than required. The downside with this approach is that queries may be frozen in non-leading tabs if the browser decides to save resources by throttling or suspending background tabs (i.e. the leader tab in that case).
+
+With the `SharedWorker` approach above this problem is mitigated, as the shared worker continues to run independently of individual tabs, ensuring that queries are not frozen even when the user switches away from the tab that initially started the worker.
+
+#### How leadership works
+
 That lock cannot live in Postgres. PGlite is a single-connection engine and every tab runs its own
 instance, so `pg_advisory_lock()` is invisible to the other tabs and would block the only connection
 this one has. Supapower coordinates in the browser instead, and picks the strongest mechanism the
@@ -507,18 +524,6 @@ released by the browser when the tab closes or crashes, and a visible tab gives 
 it is hidden. A hidden tab never drains the queue - browsers throttle or freeze timers in hidden
 tabs, so a hidden leader would stall the queue for every tab - and no tab drains while every tab is
 hidden. Read `sync.leadership` to see which mechanism you ended up with.
-
-> [!IMPORTANT]
-> Use the [multi-tab worker](https://pglite.dev/docs/multi-tab-worker) as shown in [step 2](#2-set-up-pglite).
-> Opening a plain `PGlite` instance against the same `dataDir` from several tabs risks corrupting the
-> database no matter what Supapower does with the queue, the `visible-tab` strategy only keeps two tabs
-> from pushing the same changes.
-
-For the strongest setup, use [`@supapower/worker`](https://github.com/aboviq/supapower/tree/main/packages/worker#readme)
-instead of PGlite's own multi-tab worker. It hosts the database in a `SharedWorker` shared by every
-tab, falling back to PGlite's own dedicated worker automatically where `SharedWorker` isn't
-available, so the database is never owned by a particular tab and never has to be handed over when
-one closes.
 
 ### Error handling
 
