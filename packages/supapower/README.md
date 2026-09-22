@@ -281,7 +281,7 @@ interface SupapowerSync {
   /**
    * How the single active syncer is elected across tabs and processes.
    */
-  readonly leadership: 'worker-leader' | 'web-lock' | 'single-process';
+  readonly leadership: 'visible-tab' | 'web-lock' | 'single-process';
   /**
    * Stops the synchronization process. Local changes are still tracked.
    * Resolves once the realtime channel has been left. Never rejects.
@@ -496,21 +496,29 @@ instance, so `pg_advisory_lock()` is invisible to the other tabs and would block
 this one has. Supapower coordinates in the browser instead, and picks the strongest mechanism the
 runtime offers:
 
-| `leadership`     | When                                                                         | Mechanism                                                                                                                  |
-| ---------------- | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `worker-leader`  | The database is a [`PGliteWorker`](https://pglite.dev/docs/multi-tab-worker) | PGlite's own leader election - the tab that hosts the database                                                             |
-| `web-lock`       | A plain `PGlite` instance in a browser                                       | An exclusive [Web Lock](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) named `supapower:outgoing:<scope>` |
-| `single-process` | Node, Bun, Deno                                                              | None - a second process is assumed not to exist                                                                            |
+| `leadership`     | When                                                   | Mechanism                                                                                                                                                      |
+| ---------------- | ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `visible-tab`    | A browser tab                                          | An exclusive [Web Lock](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) named `supapower:outgoing:<scope>`, held only while the tab is visible |
+| `web-lock`       | A browser context without a `document` (e.g. a worker) | The same lock, held unconditionally                                                                                                                            |
+| `single-process` | Node, Bun, Deno                                        | None - a second process is assumed not to exist                                                                                                                |
 
-Leadership is handed over on its own: a Web Lock is released by the browser when the tab closes or
-crashes, and `PGliteWorker` re-runs its election. The waiting tab takes over and resumes draining
-where the previous one left off. Read `sync.leadership` to see which mechanism you ended up with.
+Leadership moves on its own when the leading tab is hidden, closed or crashes: a Web Lock is
+released by the browser when the tab closes or crashes, and a visible tab gives it up the instant
+it is hidden. A hidden tab never drains the queue - browsers throttle or freeze timers in hidden
+tabs, so a hidden leader would stall the queue for every tab - and no tab drains while every tab is
+hidden. Read `sync.leadership` to see which mechanism you ended up with.
 
 > [!IMPORTANT]
 > Use the [multi-tab worker](https://pglite.dev/docs/multi-tab-worker) as shown in [step 2](#2-set-up-pglite).
 > Opening a plain `PGlite` instance against the same `dataDir` from several tabs risks corrupting the
-> database no matter what Supapower does with the queue, the `web-lock` strategy only keeps two tabs from
-> pushing the same changes.
+> database no matter what Supapower does with the queue, the `visible-tab` strategy only keeps two tabs
+> from pushing the same changes.
+
+For the strongest setup, use [`@supapower/worker`](https://github.com/aboviq/supapower/tree/main/packages/worker#readme)
+instead of PGlite's own multi-tab worker. It hosts the database in a `SharedWorker` shared by every
+tab, falling back to PGlite's own dedicated worker automatically where `SharedWorker` isn't
+available, so the database is never owned by a particular tab and never has to be handed over when
+one closes.
 
 ### Error handling
 

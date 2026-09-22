@@ -2,6 +2,8 @@
 export interface FakeLockManager {
   /** Every lock name that has been requested, in order. */
   readonly requested: string[];
+  /** Whether the lock is currently granted and not yet released. */
+  readonly held: boolean;
   request(
     name: string,
     options: { mode: 'exclusive'; signal: AbortSignal },
@@ -18,9 +20,13 @@ export interface FakeLockManager {
 export function createFakeLockManager(): FakeLockManager {
   const requested: string[] = [];
   let pending: (() => void) | undefined;
+  let held = false;
 
   return {
     requested,
+    get held() {
+      return held;
+    },
     async request(name, options, callback) {
       requested.push(name);
 
@@ -34,7 +40,14 @@ export function createFakeLockManager(): FakeLockManager {
         );
       });
 
-      await callback();
+      pending = undefined;
+      held = true;
+
+      try {
+        await callback();
+      } finally {
+        held = false;
+      }
     },
     grant() {
       pending?.();

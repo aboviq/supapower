@@ -16,6 +16,7 @@
     "@electric-sql/pglite": "^0.5.8",
     "@supabase/supabase-js": "^2.116.0",
     "@supapower/vue": "workspace:*",
+    "@supapower/worker": "workspace:*",
     "supapower": "workspace:*",
     "vue": "^3.5.43"
   },

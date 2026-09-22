@@ -1,0 +1,62 @@
+{
+  "name": "@supapower/worker",
+  "version": "0.0.0",
+  "description": "A more stable drop-in replacement for PGlite's built-in multi-tab worker, using a SharedWorker with automatic fallback",
+  "keywords": [
+    "local-first",
+    "multi-tab",
+    "pglite",
+    "shared-worker",
+    "supapower",
+    "worker"
+  ],
+  "homepage": "https://github.com/aboviq/supapower/tree/main/packages/worker#readme",
+  "bugs": {
+    "url": "https://github.com/aboviq/supapower/issues"
+  },
+  "license": "Apache-2.0",
+  "author": "Aboviq AB",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aboviq/supapower.git",
+    "directory": "packages/worker"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./worker": {
+      "types": "./dist/worker.d.ts",
+      "default": "./dist/worker.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "typecheck": "tsc --project tsconfig.json"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8"
+  },
+  "peerDependencies": {
+    "@electric-sql/pglite": ">=0.5.8 <0.6.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -14,18 +14,20 @@
 /**
  * The strategy a {@link Leadership} uses to decide who drains the queue.
  *
- * - `worker-leader` - `PGliteWorker`'s own leader election, which is the tab
- *   that actually hosts the database. Preferred, because it is the same
- *   election that decides who owns the files.
- * - `web-lock` - a named lock of our own via the Web Locks API, used when the
- *   database is a plain `PGlite` instance in a browser. Note that running a
- *   plain `PGlite` against the same `dataDir` in several tabs risks corrupting
- *   the database whatever this lock does; use `PGliteWorker` instead.
+ * - `visible-tab` - a named lock of our own via the Web Locks API, competed
+ *   for only while the tab is visible. Every tab reaches the shared database
+ *   through the same worker or files regardless of who leads, so leadership
+ *   is free to follow visibility instead of database ownership. Hidden tabs
+ *   get their timers throttled or frozen by the browser, so a hidden leader
+ *   would stall the queue for every tab.
+ * - `web-lock` - the same named lock, held unconditionally, used in a browser
+ *   context without a `document` (e.g. a worker) where visibility does not
+ *   apply.
  * - `single-process` - no coordination, for runtimes without the Web Locks API
  *   (Node, Bun, Deno) where a second process opening the same directory is not
  *   something this package can detect.
  */
-export type LeadershipStrategy = 'worker-leader' | 'web-lock' | 'single-process';
+export type LeadershipStrategy = 'visible-tab' | 'web-lock' | 'single-process';
 
 /**
  * Called every time leadership is acquired.
@@ -52,17 +54,6 @@ export interface Leadership {
 }
 
 /**
- * The part of `PGliteWorker` that tells us about leader election.
- *
- * Typed structurally so this package does not have to import
- * `@electric-sql/pglite/worker`, which cannot be loaded outside a browser.
- */
-export interface LeaderAware {
-  readonly isLeader: boolean;
-  onLeaderChange(callback: () => void): () => void;
-}
-
-/**
  * The slice of the Web Locks API this module needs.
  *
  * Declared locally because the package has to typecheck without the DOM lib.
@@ -76,18 +67,14 @@ interface LockManager {
 }
 
 /**
- * Whether the instance carries `PGliteWorker`'s leader election.
+ * The slice of `document` this module needs.
  *
- * PGlite hands extensions the `PGliteWorker` itself on the client side of a
- * worker, so the presence of `onLeaderChange` is what distinguishes a
- * worker-backed database from a plain one.
+ * Declared locally because the package has to typecheck without the DOM lib.
  */
-export function isLeaderAware(pg: object): pg is LeaderAware {
-  return (
-    'onLeaderChange' in pg
-    && typeof (pg as LeaderAware).onLeaderChange === 'function'
-    && typeof (pg as LeaderAware).isLeader === 'boolean'
-  );
+interface VisibilityDocument {
+  readonly visibilityState: string;
+  addEventListener(type: 'visibilitychange', listener: () => void): void;
+  removeEventListener(type: 'visibilitychange', listener: () => void): void;
 }
 
 function getLockManager(): LockManager | undefined {
@@ -96,40 +83,13 @@ function getLockManager(): LockManager | undefined {
   return typeof navigator?.locks?.request === 'function' ? navigator.locks : undefined;
 }
 
-/** Follows `PGliteWorker`'s leader election. */
-export function workerLeadership(pg: LeaderAware): Leadership {
-  return {
-    strategy: 'worker-leader',
-    subscribe(onAcquired) {
-      let held: AbortController | undefined;
+function getDocument(): VisibilityDocument | undefined {
+  const { document } = globalThis as { document?: VisibilityDocument };
 
-      const update = () => {
-        if (pg.isLeader) {
-          if (held) {
-            return; // already leading, `leader-change` fired for another reason
-          }
-
-          held = new AbortController();
-          onAcquired(held.signal);
-
-          return;
-        }
-
-        held?.abort();
-        held = undefined;
-      };
-
-      const offLeaderChange = pg.onLeaderChange(update);
-
-      update();
-
-      return () => {
-        offLeaderChange();
-        held?.abort();
-        held = undefined;
-      };
-    },
-  };
+  return typeof document?.addEventListener === 'function'
+    && typeof document.visibilityState === 'string'
+    ? document
+    : undefined;
 }
 
 /**
@@ -183,6 +143,46 @@ export function webLockLeadership(locks: LockManager, name: string): Leadership 
   };
 }
 
+/**
+ * Competes for the outgoing lock only while the tab is visible.
+ *
+ * Hidden tabs get their timers throttled or frozen by the browser, so a hidden
+ * leader stalls the queue for every tab. Leadership is given up the moment the
+ * tab is hidden - immediately, never on a timer, because a frozen timer would
+ * hold the lock and block the tab the user is actually looking at.
+ */
+export function visibleTabLeadership(
+  locks: LockManager,
+  name: string,
+  document: VisibilityDocument,
+): Leadership {
+  return {
+    strategy: 'visible-tab',
+    subscribe(onAcquired) {
+      const inner = webLockLeadership(locks, name);
+      let release: (() => void) | undefined;
+
+      const update = () => {
+        if (document.visibilityState === 'visible') {
+          release ??= inner.subscribe(onAcquired);
+        } else {
+          release?.();
+          release = undefined;
+        }
+      };
+
+      document.addEventListener('visibilitychange', update);
+      update();
+
+      return () => {
+        document.removeEventListener('visibilitychange', update);
+        release?.();
+        release = undefined;
+      };
+    },
+  };
+}
+
 /** Assumes this process is alone with the database. */
 export function singleProcessLeadership(): Leadership {
   return {
@@ -202,18 +202,18 @@ export function singleProcessLeadership(): Leadership {
 /**
  * Picks the strongest coordination the current runtime offers.
  *
- * @param pg The database to coordinate around.
  * @param scope Identifies the database being synced, so two apps on the same
- *   origin do not compete for one lock. Only used by the `web-lock` strategy.
+ *   origin do not compete for one lock. Used by both browser strategies.
  */
-export function createLeadership(pg: object, scope: string): Leadership {
-  if (isLeaderAware(pg)) {
-    return workerLeadership(pg);
-  }
-
+export function createLeadership(scope: string): Leadership {
   const locks = getLockManager();
 
-  return locks
-    ? webLockLeadership(locks, `supapower:outgoing:${scope}`)
-    : singleProcessLeadership();
+  if (!locks) {
+    return singleProcessLeadership();
+  }
+
+  const name = `supapower:outgoing:${scope}`;
+  const document = getDocument();
+
+  return document ? visibleTabLeadership(locks, name, document) : webLockLeadership(locks, name);
 }

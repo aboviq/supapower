@@ -3,7 +3,8 @@ import { describe, expect, test } from 'bun:test';
 import { SupapowerError } from './errors.js';
 import { SupapowerErrorEvent } from './events.js';
 import { createSupapower } from './index.js';
-import { asPGlite, createFakePGlite, createFakeWorkerPGlite } from './tests/pglite.js';
+import { installLeadershipEnv } from './tests/leadership.js';
+import { asPGlite, createFakePGlite } from './tests/pglite.js';
 import { asSupabaseClient, createFakeSupabase } from './tests/supabase.js';
 
 const idleSupabase = asSupabaseClient(createFakeSupabase());
@@ -42,13 +43,15 @@ describe('supapower.status', () => {
   });
 
   test('a follower tab never reports leading or connecting', async () => {
-    const namespace = createSupapower(asPGlite(createFakeWorkerPGlite({ isLeader: false })));
+    const env = installLeadershipEnv();
+    const namespace = createSupapower(asPGlite(createFakePGlite()));
     const sync = await namespace.sync({ supabase: idleSupabase, tables: [] });
 
     expect(namespace.status.leading).toBe(false);
     expect(namespace.status.connecting).toBe(false);
 
     await sync.unsubscribe();
+    env.restore();
   });
 
   test('tracks a download in progress', () => {

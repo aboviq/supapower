@@ -35,6 +35,12 @@
       "rules": {
         "no-console": "off"
       }
+    },
+    {
+      "files": ["packages/worker/**"],
+      "rules": {
+        "unicorn/require-post-message-target-origin": "off"
+      }
     }
   ]
 }

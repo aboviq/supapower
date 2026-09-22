@@ -25,16 +25,6 @@ export interface FakePGlite {
   listen(): Promise<() => Promise<void>>;
 }
 
-/** A {@link FakePGlite} that also carries `PGliteWorker`'s leader election. */
-export interface FakeWorkerPGlite extends FakePGlite {
-  isLeader: boolean;
-  onLeaderChange(callback: () => void): () => void;
-  /** Flips leadership and fires the change listeners, as the worker would. */
-  setLeader(value: boolean): void;
-  /** How many leader-change listeners are currently attached. */
-  readonly leaderListeners: number;
-}
-
 export interface FakePGliteOptions {
   /** Rows to seed the outgoing queue with. */
   changes?: ChangeRow[];
@@ -46,11 +36,6 @@ export interface FakePGliteOptions {
    * needs and what most fixtures use.
    */
   columns?: Record<string, readonly string[]>;
-}
-
-export interface FakeWorkerPGliteOptions extends FakePGliteOptions {
-  /** Whether this tab starts out as the leader. */
-  isLeader?: boolean;
 }
 
 /** Hands the fake to code that expects the real thing. */
@@ -218,44 +203,7 @@ function createBase({ changes = [], columns }: FakePGliteOptions): FakePGlite {
   };
 }
 
-/** A plain `PGlite`: no leader election, so nothing coordinates across tabs. */
+/** A `PGlite`-like instance, with no coordination across tabs of its own. */
 export function createFakePGlite(options: FakePGliteOptions = {}): FakePGlite {
   return createBase(options);
-}
-
-/**
- * A `PGliteWorker`-like instance, down to the `isLeader` / `onLeaderChange`
- * pair that {@link isLeaderAware} looks for.
- */
-export function createFakeWorkerPGlite({
-  isLeader = false,
-  ...options
-}: FakeWorkerPGliteOptions = {}): FakeWorkerPGlite {
-  const callbacks = new Set<() => void>();
-
-  // The base has only data properties, so spreading it is safe - but the
-  // leader parts must be declared here rather than assigned onto it, since
-  // both a spread and `Object.assign` would read `leaderListeners` once and
-  // freeze the count.
-  const pg: FakeWorkerPGlite = {
-    ...createBase(options),
-    isLeader,
-    onLeaderChange(callback: () => void) {
-      callbacks.add(callback);
-
-      return () => callbacks.delete(callback);
-    },
-    setLeader(value: boolean) {
-      pg.isLeader = value;
-
-      for (const callback of callbacks) {
-        callback();
-      }
-    },
-    get leaderListeners() {
-      return callbacks.size;
-    },
-  };
-
-  return pg;
 }

@@ -1,15 +1,11 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 
 import { isSupapowerError } from './errors.js';
 import { createSupapower } from './index.js';
 import { settle, waitFor } from './tests/async.js';
 import { createChange } from './tests/changes.js';
-import {
-  asPGlite,
-  createFakePGlite,
-  createFakeWorkerPGlite,
-  type FakePGlite,
-} from './tests/pglite.js';
+import { installLeadershipEnv, type FakeLeadershipEnv } from './tests/leadership.js';
+import { asPGlite, createFakePGlite, type FakePGlite } from './tests/pglite.js';
 import { asSupabaseClient, createFakeSupabase, type FakeSupabase } from './tests/supabase.js';
 
 /** Nothing is ever pushed or subscribed in the lifecycle tests below. */
@@ -19,6 +15,16 @@ const ran = (pg: FakePGlite, fragment: string) =>
   pg.statements.some((statement) => statement.includes(fragment));
 
 describe('createSupapower().sync', () => {
+  let env: FakeLeadershipEnv;
+
+  beforeEach(() => {
+    env = installLeadershipEnv();
+  });
+
+  afterEach(() => {
+    env.restore();
+  });
+
   test('sets up the schema and starts draining the queue', async () => {
     const pg = createFakePGlite();
 
@@ -27,6 +33,7 @@ describe('createSupapower().sync', () => {
       tables: ['todos'],
     });
 
+    env.locks.grant();
     await settle();
 
     expect(ran(pg, 'CREATE SCHEMA IF NOT EXISTS supapower')).toBe(true);
@@ -37,25 +44,18 @@ describe('createSupapower().sync', () => {
   });
 
   test('reports which leadership strategy it ended up with', async () => {
-    const plain = await createSupapower(asPGlite(createFakePGlite())).sync({
+    const sync = await createSupapower(asPGlite(createFakePGlite())).sync({
       supabase: idleSupabase,
       tables: [],
     });
 
-    expect(plain.leadership).toBe('single-process');
+    expect(sync.leadership).toBe('visible-tab');
 
-    const worker = await createSupapower(asPGlite(createFakeWorkerPGlite({ isLeader: true }))).sync(
-      { supabase: idleSupabase, tables: [] },
-    );
-
-    expect(worker.leadership).toBe('worker-leader');
-
-    plain.unsubscribe();
-    worker.unsubscribe();
+    sync.unsubscribe();
   });
 
   test('sets up the schema but does not drain when another tab is the leader', async () => {
-    const pg = createFakeWorkerPGlite();
+    const pg = createFakePGlite();
 
     const sync = await createSupapower(asPGlite(pg)).sync({
       supabase: idleSupabase,
@@ -71,7 +71,7 @@ describe('createSupapower().sync', () => {
   });
 
   test('starts draining as soon as this tab becomes the leader', async () => {
-    const pg = createFakeWorkerPGlite();
+    const pg = createFakePGlite();
 
     const sync = await createSupapower(asPGlite(pg)).sync({
       supabase: idleSupabase,
@@ -79,7 +79,7 @@ describe('createSupapower().sync', () => {
     });
 
     await settle();
-    pg.setLeader(true);
+    env.locks.grant();
     await settle();
 
     expect(ran(pg, 'SELECT tx_id FROM supapower.changes')).toBe(true);
@@ -88,31 +88,29 @@ describe('createSupapower().sync', () => {
   });
 
   test('unsubscribe releases leadership and is idempotent', async () => {
-    const pg = createFakeWorkerPGlite({ isLeader: true });
+    const pg = createFakePGlite();
 
     const sync = await createSupapower(asPGlite(pg)).sync({
       supabase: idleSupabase,
       tables: ['todos'],
     });
 
+    env.locks.grant();
     await settle();
 
-    expect(pg.leaderListeners).toBe(1);
+    expect(env.locks.held).toBe(true);
 
-    const stopping = sync.unsubscribe();
-
-    // Releasing leadership happens before the first await, so it is already
-    // done; the promise only covers what could not stop synchronously.
-    expect(pg.leaderListeners).toBe(0);
-
-    await stopping;
     await sync.unsubscribe();
 
-    expect(pg.leaderListeners).toBe(0);
+    expect(env.locks.held).toBe(false);
+
+    await sync.unsubscribe();
+
+    expect(env.locks.held).toBe(false);
   });
 
   test('aborting the caller signal unsubscribes', async () => {
-    const pg = createFakeWorkerPGlite({ isLeader: true });
+    const pg = createFakePGlite();
     const controller = new AbortController();
 
     await createSupapower(asPGlite(pg)).sync({
@@ -121,17 +119,19 @@ describe('createSupapower().sync', () => {
       signal: controller.signal,
     });
 
+    env.locks.grant();
     await settle();
 
-    expect(pg.leaderListeners).toBe(1);
+    expect(env.locks.held).toBe(true);
 
     controller.abort();
+    await settle();
 
-    expect(pg.leaderListeners).toBe(0);
+    expect(env.locks.held).toBe(false);
   });
 
   test('a signal that is already aborted never touches the database', async () => {
-    const pg = createFakeWorkerPGlite({ isLeader: true });
+    const pg = createFakePGlite();
 
     const sync = await createSupapower(asPGlite(pg)).sync({
       supabase: idleSupabase,
@@ -142,7 +142,7 @@ describe('createSupapower().sync', () => {
     await settle();
 
     expect(pg.statements).toEqual([]);
-    expect(pg.leaderListeners).toBe(0);
+    expect(env.locks.requested).toEqual([]);
 
     sync.unsubscribe();
   });
@@ -151,11 +151,25 @@ describe('createSupapower().sync', () => {
 describe('createSupapower().sync - incoming subscription', () => {
   const tables = ['todos', { table: 'plans', access: 'anon' as const }];
 
-  const start = async (supabase: FakeSupabase, pg = createFakeWorkerPGlite({ isLeader: true })) => {
+  let env: FakeLeadershipEnv;
+
+  beforeEach(() => {
+    env = installLeadershipEnv();
+  });
+
+  afterEach(() => {
+    env.restore();
+  });
+
+  const start = async (supabase: FakeSupabase, pg = createFakePGlite(), lead = true) => {
     const sync = await createSupapower(asPGlite(pg)).sync({
       supabase: asSupabaseClient(supabase),
       tables,
     });
+
+    if (lead) {
+      env.locks.grant();
+    }
 
     await settle(); // the auth listener reports INITIAL_SESSION on a microtask
 
@@ -253,13 +267,14 @@ describe('createSupapower().sync - incoming subscription', () => {
 
   test('reports a channel it could not leave instead of rejecting', async () => {
     const supabase = createFakeSupabase({ user: 'user-a', removeChannelError: true });
-    const supapower = createSupapower(asPGlite(createFakeWorkerPGlite({ isLeader: true })));
+    const supapower = createSupapower(asPGlite(createFakePGlite()));
     const codes: string[] = [];
 
     supapower.events.addEventListener('error', ({ error }) => codes.push(error.code));
 
     const sync = await supapower.sync({ supabase: asSupabaseClient(supabase), tables });
 
+    env.locks.grant();
     await settle();
     await sync.unsubscribe();
 
@@ -269,7 +284,7 @@ describe('createSupapower().sync - incoming subscription', () => {
   test('does not subscribe at all when another tab is the leader', async () => {
     const supabase = createFakeSupabase({ user: 'user-a' });
 
-    const sync = await start(supabase, createFakeWorkerPGlite());
+    const sync = await start(supabase, createFakePGlite(), false);
 
     expect(supabase.channels).toEqual([]);
 
@@ -280,19 +295,30 @@ describe('createSupapower().sync - incoming subscription', () => {
 describe('createSupapower().sync - initial download', () => {
   const tables = ['todos', { table: 'plans', access: 'anon' as const }];
 
+  let env: FakeLeadershipEnv;
+
+  beforeEach(() => {
+    env = installLeadershipEnv();
+  });
+
+  afterEach(() => {
+    env.restore();
+  });
+
   const start = async (supabase: FakeSupabase, pg: FakePGlite) => {
     const sync = await createSupapower(asPGlite(pg)).sync({
       supabase: asSupabaseClient(supabase),
       tables,
     });
 
+    env.locks.grant();
     await settle();
 
     return sync;
   };
 
   test('downloads only the anon tables while nobody is signed in', async () => {
-    const pg = createFakeWorkerPGlite({ isLeader: true });
+    const pg = createFakePGlite();
     const supabase = createFakeSupabase();
 
     const sync = await start(supabase, pg);
@@ -304,7 +330,7 @@ describe('createSupapower().sync - initial download', () => {
   });
 
   test('downloads every table once a user is signed in', async () => {
-    const pg = createFakeWorkerPGlite({ isLeader: true });
+    const pg = createFakePGlite();
     const supabase = createFakeSupabase({ user: 'user-a', rows: { todos: [{ id: 1 }] } });
 
     const sync = await start(supabase, pg);
@@ -317,7 +343,7 @@ describe('createSupapower().sync - initial download', () => {
   });
 
   test('empties and re-downloads the authenticated tables when the user changes', async () => {
-    const pg = createFakeWorkerPGlite({ isLeader: true });
+    const pg = createFakePGlite();
     const supabase = createFakeSupabase({ user: 'user-a' });
 
     const sync = await start(supabase, pg);
@@ -336,7 +362,7 @@ describe('createSupapower().sync - initial download', () => {
   });
 
   test('empties the authenticated tables on sign out and does not re-download them', async () => {
-    const pg = createFakeWorkerPGlite({ isLeader: true });
+    const pg = createFakePGlite();
     const supabase = createFakeSupabase({ user: 'user-a' });
 
     const sync = await start(supabase, pg);
@@ -353,7 +379,7 @@ describe('createSupapower().sync - initial download', () => {
   });
 
   test('leaves everything alone when only the token was refreshed', async () => {
-    const pg = createFakeWorkerPGlite({ isLeader: true });
+    const pg = createFakePGlite();
     const supabase = createFakeSupabase({ user: 'user-a' });
 
     const sync = await start(supabase, pg);
@@ -378,15 +404,29 @@ describe('createSupapower().sync - initial download', () => {
 describe('createSupapower().sync - waiting for authentication', () => {
   const tables = ['todos', { table: 'plans', access: 'anon' as const }];
 
-  const start = async (supabase: FakeSupabase, pg: FakePGlite) =>
-    createSupapower(asPGlite(pg)).sync({
+  let env: FakeLeadershipEnv;
+
+  beforeEach(() => {
+    env = installLeadershipEnv();
+  });
+
+  afterEach(() => {
+    env.restore();
+  });
+
+  const start = async (supabase: FakeSupabase, pg: FakePGlite) => {
+    const sync = await createSupapower(asPGlite(pg)).sync({
       supabase: asSupabaseClient(supabase),
       tables,
     });
 
+    env.locks.grant();
+
+    return sync;
+  };
+
   test('touches nothing until the auth client has reported an identity', async () => {
-    const pg = createFakeWorkerPGlite({
-      isLeader: true,
+    const pg = createFakePGlite({
       changes: [createChange('100', 1, { table_name: 'todos' })],
     });
     const supabase = createFakeSupabase({ user: 'user-a' });
@@ -405,8 +445,7 @@ describe('createSupapower().sync - waiting for authentication', () => {
   });
 
   test('holds back queued changes for tables the signed out user cannot reach', async () => {
-    const pg = createFakeWorkerPGlite({
-      isLeader: true,
+    const pg = createFakePGlite({
       changes: [
         createChange('100', 1, { table_name: 'todos' }),
         createChange('101', 2, { table_name: 'plans' }),
@@ -430,7 +469,7 @@ describe('createSupapower().sync - waiting for authentication', () => {
 
 describe('createSupapower().sync - primary key validation', () => {
   test('refuses to start when a configured primary key is not a column', async () => {
-    const pg = createFakeWorkerPGlite({ isLeader: true, columns: { tags: ['id', 'name'] } });
+    const pg = createFakePGlite({ columns: { tags: ['id', 'name'] } });
 
     const failing = createSupapower(asPGlite(pg)).sync({
       supabase: idleSupabase,
@@ -444,9 +483,18 @@ describe('createSupapower().sync - primary key validation', () => {
 });
 
 describe('createSupapower().sync - tables outside "public"', () => {
+  let env: FakeLeadershipEnv;
+
+  beforeEach(() => {
+    env = installLeadershipEnv();
+  });
+
+  afterEach(() => {
+    env.restore();
+  });
+
   test('tracks, subscribes and pushes each table where it belongs', async () => {
-    const pg = createFakeWorkerPGlite({
-      isLeader: true,
+    const pg = createFakePGlite({
       columns: { 'app.todos': ['id', 'title'], 'mirror.notes': ['id', 'title'] },
       changes: [createChange('100', 1, { schema_name: 'mirror', table_name: 'notes' })],
     });
@@ -464,6 +512,7 @@ describe('createSupapower().sync - tables outside "public"', () => {
       ],
     });
 
+    env.locks.grant();
     await settle();
 
     expect(ran(pg, 'AFTER INSERT ON "app"."todos"')).toBe(true);
@@ -477,7 +526,7 @@ describe('createSupapower().sync - tables outside "public"', () => {
   });
 
   test('refuses a primary key the table lacks in its local schema', async () => {
-    const pg = createFakeWorkerPGlite({ isLeader: true, columns: { 'app.tags': ['id', 'name'] } });
+    const pg = createFakePGlite({ columns: { 'app.tags': ['id', 'name'] } });
 
     const failing = createSupapower(asPGlite(pg)).sync({
       supabase: idleSupabase,

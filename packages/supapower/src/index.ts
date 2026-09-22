@@ -219,7 +219,7 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
       scope = 'default',
       onUnrecoverableError,
     }: SupapowerSyncOptions): Promise<SupapowerSync> {
-      const leadership = createLeadership(pg, scope);
+      const leadership = createLeadership(scope);
 
       let configs = new Map<string, SupapowerSyncedTable>();
       let stopLeadership: (() => void) | undefined;

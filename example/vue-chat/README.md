@@ -1,12 +1,12 @@
 # Vue chat example
 
-A browser chat app built on [Supapower](../../packages/supapower/) and
-[`@supapower/vue`](../../packages/vue/): every browser tab shares one IndexedDB-backed
-[PGlite](https://pglite.dev/) database through
-[PGlite's multi-tab worker](https://pglite.dev/docs/multi-tab-worker), and messages sync to
-Supabase in the background, both ways, so other browsers and devices see them too. Open the app in
-two tabs to watch a message sent in one show up in the other instantly, through the shared local
-database, before Supabase is even in the picture.
+A browser chat app built on [Supapower](../../packages/supapower/), [`@supapower/vue`](../../packages/vue/)
+and [`@supapower/worker`](../../packages/worker/): every browser tab shares one IndexedDB-backed
+[PGlite](https://pglite.dev/) database through a `SharedWorker` (falling back automatically to
+PGlite's own [dedicated worker](https://pglite.dev/docs/multi-tab-worker) where `SharedWorker` isn't
+available), and messages sync to Supabase in the background, both ways, so other browsers and devices
+see them too. Open the app in two tabs to watch a message sent in one show up in the other instantly,
+through the shared local database, before Supabase is even in the picture.
 
 ## Setup
 
@@ -91,19 +91,20 @@ typed in one tab appears in every other tab's list immediately, through the shar
 whether or not Supabase is reachable. Each tab is still its own chat user: your name is stored in
 that tab's `sessionStorage`, so opening a second tab asks for a name again.
 
-Only one tab - the elected leader - downloads, uploads and holds the Supabase realtime channel; every
-other tab is a follower and its status line reads `○ follower · another tab is syncing` instead of
-`● connected`/`○ connecting…`/`○ idle`. Close the leader tab and PGlite re-runs its election; the
-remaining tab takes over and its status line switches to the leader wording, with
-`leadership: worker-leader` in both cases - see
+Only one tab - whichever is visible and holds the leadership lock - downloads, uploads and holds the
+Supabase realtime channel; every other tab is a follower and its status line reads
+`○ follower · another tab is syncing` instead of `● connected`/`○ connecting…`/`○ idle`. Switch to
+the other tab and it takes over, with `leadership: visible-tab` in both cases - see
 [Multi-tab behavior](../../packages/supapower/README.md#multi-tab-behavior) in the core README for
 why leadership exists and how it changes hands.
 
 ## What it demonstrates
 
-- `extensions` from [`@supapower/vue`](../../packages/vue/), passed as the second argument to
-  [`PGliteWorker.create`](https://pglite.dev/docs/multi-tab-worker) on the client side - not inside
-  the worker's `init()`, since `PGliteWorker` strips `extensions` before forwarding options to the
+- `createPGliteWorker` from [`@supapower/worker`](../../packages/worker/), which tries a
+  `SharedWorker` first and falls back to PGlite's own dedicated worker automatically - `pg.transport`
+  (logged to the console on startup) reports which one won.
+- `extensions` from [`@supapower/vue`](../../packages/vue/), passed on the client side - not inside
+  the worker's `init()`, since the worker client strips `extensions` before forwarding options to the
   worker.
 - `pg.supapower.sync()` with `access: 'anon'`, since this demo has no sign in flow - see
   [`SupapowerTableConfig.access`](../../packages/supapower/README.md#supapowertableconfig---tracked-tables-configuration)
@@ -115,8 +116,8 @@ why leadership exists and how it changes hands.
 - `useSupapowerStatus()`, reading `leading` before every other field: on a follower tab every other
   field stays `false` even though its data keeps arriving, so the status line branches on `leading`
   first.
-- `sync.leadership` reporting which coordination mechanism won - `worker-leader` here, since the
-  database is a `PGliteWorker`. See
+- `sync.leadership` reporting which coordination mechanism won - `visible-tab` here, since the
+  database is a `PGliteWorker` opened from a browser tab. See
   [Multi-tab behavior](../../packages/supapower/README.md#multi-tab-behavior) in the core README for
   the other mechanisms.
 

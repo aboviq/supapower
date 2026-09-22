@@ -2,90 +2,13 @@ import { describe, expect, test } from 'bun:test';
 
 import {
   createLeadership,
-  isLeaderAware,
   singleProcessLeadership,
+  visibleTabLeadership,
   webLockLeadership,
-  workerLeadership,
 } from './leadership.js';
 import { settle } from './tests/async.js';
-import { createFakePGlite, createFakeWorkerPGlite } from './tests/pglite.js';
+import { createFakeDocument } from './tests/visibility.js';
 import { createFakeLockManager } from './tests/web-locks.js';
-
-describe('isLeaderAware', () => {
-  test('detects a PGliteWorker-like instance', () => {
-    expect(isLeaderAware(createFakeWorkerPGlite())).toBe(true);
-  });
-
-  test('rejects a plain PGlite-like instance', () => {
-    expect(isLeaderAware(createFakePGlite())).toBe(false);
-  });
-});
-
-describe('workerLeadership', () => {
-  test('acquires immediately when already the leader', () => {
-    const pg = createFakeWorkerPGlite({ isLeader: true });
-    const signals: AbortSignal[] = [];
-
-    workerLeadership(pg).subscribe((signal) => signals.push(signal));
-
-    expect(signals).toHaveLength(1);
-    expect(signals[0]?.aborted).toBe(false);
-  });
-
-  test('waits for the leader-change event when it is not the leader', () => {
-    const pg = createFakeWorkerPGlite();
-    const signals: AbortSignal[] = [];
-
-    workerLeadership(pg).subscribe((signal) => signals.push(signal));
-
-    expect(signals).toHaveLength(0);
-
-    pg.setLeader(true);
-
-    expect(signals).toHaveLength(1);
-  });
-
-  test('aborts the signal when leadership is lost and hands out a fresh one later', () => {
-    const pg = createFakeWorkerPGlite({ isLeader: true });
-    const signals: AbortSignal[] = [];
-
-    workerLeadership(pg).subscribe((signal) => signals.push(signal));
-    pg.setLeader(false);
-
-    expect(signals[0]?.aborted).toBe(true);
-
-    pg.setLeader(true);
-
-    expect(signals).toHaveLength(2);
-    expect(signals[1]?.aborted).toBe(false);
-  });
-
-  test('ignores leader-change events that do not change leadership', () => {
-    const pg = createFakeWorkerPGlite({ isLeader: true });
-    const signals: AbortSignal[] = [];
-
-    workerLeadership(pg).subscribe((signal) => signals.push(signal));
-    pg.setLeader(true);
-    pg.setLeader(true);
-
-    expect(signals).toHaveLength(1);
-    expect(signals[0]?.aborted).toBe(false);
-  });
-
-  test('releasing aborts the signal and detaches the listener', () => {
-    const pg = createFakeWorkerPGlite({ isLeader: true });
-    const signals: AbortSignal[] = [];
-
-    const release = workerLeadership(pg).subscribe((signal) => signals.push(signal));
-
-    expect(pg.leaderListeners).toBe(1);
-
-    release();
-
-    expect(signals[0]?.aborted).toBe(true);
-    expect(pg.leaderListeners).toBe(0);
-  });
-});
 
 describe('webLockLeadership', () => {
   test('acquires once the lock is granted, under a scoped name', async () => {
@@ -131,6 +54,92 @@ describe('webLockLeadership', () => {
   });
 });
 
+describe('visibleTabLeadership', () => {
+  test('a hidden tab requests no lock until it becomes visible', async () => {
+    const locks = createFakeLockManager();
+    const document = createFakeDocument('hidden');
+    const signals: AbortSignal[] = [];
+
+    visibleTabLeadership(locks, 'supapower:outgoing:app', document).subscribe((signal) =>
+      signals.push(signal),
+    );
+
+    expect(locks.requested).toEqual([]);
+
+    document.set('visible');
+
+    expect(locks.requested).toEqual(['supapower:outgoing:app']);
+
+    locks.grant();
+    await settle();
+
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(false);
+  });
+
+  test('hiding the tab aborts the signal and releases the lock', async () => {
+    const locks = createFakeLockManager();
+    const document = createFakeDocument('visible');
+    const signals: AbortSignal[] = [];
+
+    visibleTabLeadership(locks, 'lock', document).subscribe((signal) => signals.push(signal));
+
+    locks.grant();
+    await settle();
+
+    expect(locks.held).toBe(true);
+
+    document.set('hidden');
+    await settle();
+
+    expect(signals[0]?.aborted).toBe(true);
+    expect(locks.held).toBe(false);
+  });
+
+  test('becoming visible again requests the lock afresh and hands out a new signal', async () => {
+    const locks = createFakeLockManager();
+    const document = createFakeDocument('visible');
+    const signals: AbortSignal[] = [];
+
+    visibleTabLeadership(locks, 'lock', document).subscribe((signal) => signals.push(signal));
+
+    locks.grant();
+    await settle();
+    document.set('hidden');
+    await settle();
+    document.set('visible');
+
+    expect(locks.requested).toEqual(['lock', 'lock']);
+
+    locks.grant();
+    await settle();
+
+    expect(signals).toHaveLength(2);
+    expect(signals[1]?.aborted).toBe(false);
+  });
+
+  test('releasing aborts the signal and detaches the visibility listener', async () => {
+    const locks = createFakeLockManager();
+    const document = createFakeDocument('visible');
+    const signals: AbortSignal[] = [];
+
+    const release = visibleTabLeadership(locks, 'lock', document).subscribe((signal) =>
+      signals.push(signal),
+    );
+
+    locks.grant();
+    await settle();
+
+    expect(document.listeners).toBe(1);
+
+    release();
+    await settle();
+
+    expect(signals[0]?.aborted).toBe(true);
+    expect(document.listeners).toBe(0);
+  });
+});
+
 describe('singleProcessLeadership', () => {
   test('acquires immediately and releases on demand', () => {
     const signals: AbortSignal[] = [];
@@ -146,30 +155,42 @@ describe('singleProcessLeadership', () => {
 });
 
 describe('createLeadership', () => {
-  test('prefers the PGliteWorker leader election', () => {
-    expect(createLeadership(createFakeWorkerPGlite(), 'app').strategy).toBe('worker-leader');
-  });
-
-  test('falls back to a named Web Lock when one is available', () => {
+  test('prefers visible-tab coordination when both a document and Web Locks are available', () => {
     const navigator = globalThis.navigator as { locks?: unknown };
+    const document = globalThis as { document?: unknown };
     const locks = createFakeLockManager();
 
     navigator.locks = locks;
+    document.document = createFakeDocument();
 
     try {
-      const leadership = createLeadership(createFakePGlite(), 'app');
+      const leadership = createLeadership('app');
 
-      expect(leadership.strategy).toBe('web-lock');
+      expect(leadership.strategy).toBe('visible-tab');
 
       leadership.subscribe(() => {});
 
       expect(locks.requested).toEqual(['supapower:outgoing:app']);
     } finally {
       delete navigator.locks;
+      delete document.document;
+    }
+  });
+
+  test('falls back to a plain Web Lock without a document', () => {
+    const navigator = globalThis.navigator as { locks?: unknown };
+    const locks = createFakeLockManager();
+
+    navigator.locks = locks;
+
+    try {
+      expect(createLeadership('app').strategy).toBe('web-lock');
+    } finally {
+      delete navigator.locks;
     }
   });
 
   test('assumes a single process when there is no Web Locks API', () => {
-    expect(createLeadership(createFakePGlite(), 'app').strategy).toBe('single-process');
+    expect(createLeadership('app').strategy).toBe('single-process');
   });
 });
