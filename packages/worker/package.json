@@ -1,6 +1,6 @@
 {
   "name": "@supapower/worker",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "A more stable drop-in replacement for PGlite's built-in multi-tab worker, using a SharedWorker with automatic fallback",
   "keywords": [
     "local-first",

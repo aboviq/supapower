@@ -1,5 +1,15 @@
 # supapower
 
+## 0.3.0
+
+### Minor Changes
+
+- [`02e372b`](https://github.com/aboviq/supapower/commit/02e372bf5b9ad3f201ea2aa085c808c898b49c0c) Thanks [@joakimbeng](https://github.com/joakimbeng)! - Added a `downloadThrottle` option to `sync()` (default `60_000` ms). Leadership follows tab visibility, so switching tabs repeatedly used to start a fresh download of every table on each switch; a table whose last completed download finished more recently than `downloadThrottle` is now skipped instead. A table whose configured `cursor` or local columns have changed since it was last downloaded, and the catch-up download after a dropped realtime connection, always download regardless.
+  
+  The per-table sync record stored in `supapower.metadata` has been renamed from `SyncedCursorAt` to `TableSyncState` and is now written for every table, not only ones with a `cursor`. Existing installations download every table whole once on the first start after upgrading.
+
+- [`bbcf38c`](https://github.com/aboviq/supapower/commit/bbcf38caca3c18e21cb96667a4add6e27c2154c7) Thanks [@joakimbeng](https://github.com/joakimbeng)! - Outgoing-sync leadership no longer follows which tab hosts the PGlite database (`'worker-leader'`); it now follows tab visibility (`'visible-tab'`) instead, since a hidden tab's timers get throttled by the browser and would stall the queue for every tab. `createLeadership()` no longer takes a `pg` argument, and `isLeaderAware`, `workerLeadership`, and `LeaderAware` have been removed from `supapower/leadership`.
+
 ## 0.2.0
 
 ### Minor Changes
