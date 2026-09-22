@@ -10,7 +10,7 @@ Supapower is a sync engine that keeps a local [PGlite](https://pglite.dev/) data
 [Supabase](https://supabase.com/), so an application can read and write locally and stay usable
 while offline. It is inspired by [PowerSync](https://www.powersync.com/).
 
-> **Status:** 0.1.0. Both directions of the sync work; the public API may still change before 1.0.
+> **Status:** 0.3.0. Both directions of the sync work; the public API may still change before 1.0.
 
 ## Documentation
 
@@ -18,18 +18,19 @@ Everything below, except the [examples section](#examples), is for working with 
 
 ## Packages
 
-| Package                                 | Description                                                                                                   |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| [`supapower`](./packages/supapower/)    | The main package for Supapower - a PGlite extension that integrates with Supabase and syncs data between them |
-| [`@supapower/react`](./packages/react/) | React hooks for Supapower: PGlite live queries plus sync status                                               |
-| [`@supapower/vue`](./packages/vue/)     | Vue composables for Supapower: PGlite live queries plus sync status                                           |
+| Package                                   | Description                                                                                                                                                               |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`supapower`](./packages/supapower/)      | The main package for Supapower - a PGlite extension that integrates with Supabase and syncs data between them                                                             |
+| [`@supapower/worker`](./packages/worker/) | A more stable drop-in replacement for PGlite's built-in multi-tab worker, using a `SharedWorker` with automatic fallback - works with plain PGlite, no Supapower required |
+| [`@supapower/react`](./packages/react/)   | React hooks for Supapower: PGlite live queries plus sync status                                                                                                           |
+| [`@supapower/vue`](./packages/vue/)       | Vue composables for Supapower: PGlite live queries plus sync status                                                                                                       |
 
 ## Examples
 
-| Example                           | Description                                                                                          |
-| --------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| [`chat`](./example/chat/)         | A terminal chat app, showing a two-way sync between Supabase and PGlite                              |
-| [`vue-chat`](./example/vue-chat/) | A browser chat app, showing PGlite's multi-tab worker and a two-way sync between Supabase and PGlite |
+| Example                           | Description                                                                                                               |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| [`chat`](./example/chat/)         | A terminal chat app, showing a two-way sync between Supabase and PGlite                                                   |
+| [`vue-chat`](./example/vue-chat/) | A browser chat app, showing `@supapower/worker`'s multi-tab `SharedWorker` and a two-way sync between Supabase and PGlite |
 
 ## Requirements
 
