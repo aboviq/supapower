@@ -1,0 +1,40 @@
+---
+title: Supapower
+description: A sync engine that keeps a local PGlite database in sync with Supabase.
+template: splash
+hero:
+  tagline: With Supapower comes great sync abilities - read and write a local PGlite database, stay usable offline, and sync both ways with Supabase.
+  actions:
+    - text: Get started
+      link: ./packages/supapower/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/aboviq/supapower
+      icon: external
+      variant: minimal
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+<CardGrid>
+  <LinkCard
+    title="supapower"
+    href="./packages/supapower/"
+    description="The PGlite extension that syncs a local database with Supabase, both ways."
+  />
+  <LinkCard
+    title="@supapower/worker"
+    href="./packages/worker/"
+    description="A SharedWorker-based drop-in replacement for PGlite's multi-tab worker."
+  />
+  <LinkCard
+    title="@supapower/react"
+    href="./packages/react/"
+    description="React hooks: PGlite live queries plus sync status."
+  />
+  <LinkCard
+    title="@supapower/vue"
+    href="./packages/vue/"
+    description="Vue composables: PGlite live queries plus sync status."
+  />
+</CardGrid>

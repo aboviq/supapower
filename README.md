@@ -14,7 +14,7 @@ while offline. It is inspired by [PowerSync](https://www.powersync.com/).
 
 ## Documentation
 
-Everything below, except the [examples section](#examples), is for working with the monorepo. For documentation on the Supapower library see the [`supapower` package's readme](./packages/supapower/README.md).
+Everything below, except the [examples section](#examples), is for working with the monorepo. For documentation on the Supapower library see the [`supapower` package's readme](./packages/supapower/README.md), or the full documentation site at [supapower.dev](https://supapower.dev/).
 
 ## Packages
 

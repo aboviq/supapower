@@ -19,5 +19,5 @@
     ]
   },
   "sortPackageJson": true,
-  "ignorePatterns": ["**/dist/**", "**/*.tsbuildinfo", "bun.lock", "CHANGELOG.md"]
+  "ignorePatterns": ["**/dist/**", "**/*.tsbuildinfo", "bun.lock", "CHANGELOG.md", "**/.astro/**"]
 }

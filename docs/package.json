@@ -1,0 +1,25 @@
+{
+  "name": "docs",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Documentation site for Supapower, built with Astro and Starlight",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "bun run sync:readmes && bunx --bun astro build",
+    "clean": "rm -rf dist .astro src/content/docs/packages",
+    "dev": "bun run sync:readmes && bunx --bun astro dev",
+    "preview": "bunx --bun astro preview",
+    "typecheck": "tsc --project tsconfig.json",
+    "sync:readmes": "bun scripts/sync-readmes.ts"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.42.3",
+    "astro": "^7.3.4",
+    "sharp": "^0.35.4",
+    "starlight-theme-rapide": "^0.6.0"
+  },
+  "engines": {
+    "bun": ">=1.4.0"
+  }
+}

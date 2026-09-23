@@ -10,7 +10,8 @@
   },
   "workspaces": [
     "packages/*",
-    "example/*"
+    "example/*",
+    "docs"
   ],
   "type": "module",
   "scripts": {

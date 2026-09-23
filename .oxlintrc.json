@@ -21,7 +21,7 @@
     "typescript/no-explicit-any": "error",
     "unicorn/prefer-node-protocol": "error"
   },
-  "ignorePatterns": ["**/dist/**", "**/*.tsbuildinfo"],
+  "ignorePatterns": ["**/dist/**", "**/*.tsbuildinfo", "**/.astro/**"],
   "overrides": [
     {
       "files": ["**/*.test.ts", "**/*.test.tsx"],

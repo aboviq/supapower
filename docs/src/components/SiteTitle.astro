@@ -1,0 +1,25 @@
+---
+import logoSvg from '../../../assets/supapower.svg?raw';
+
+const { siteTitle, siteTitleHref } = Astro.locals.starlightRoute;
+---
+
+<a href={siteTitleHref} class="site-title sl-flex">
+  <Fragment set:html={logoSvg} />
+  <span class="sr-only" translate="no">{siteTitle}</span>
+</a>
+
+<style>
+  @layer starlight.core {
+    .site-title {
+      align-items: center;
+      gap: var(--sl-nav-gap);
+      min-width: 0;
+    }
+    .site-title :global(svg) {
+      height: calc(var(--sl-nav-height) - 2 * var(--sl-nav-pad-y));
+      width: auto;
+      max-width: 100%;
+    }
+  }
+</style>
