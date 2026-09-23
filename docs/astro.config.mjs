@@ -9,12 +9,14 @@ export default defineConfig({
       plugins: [starlightThemeRapide()],
       title: 'Supapower',
       description:
-        'A sync engine that keeps a local PGlite database in sync with Supabase, so an application can read and write locally and stay usable while offline.',
+        'Offline-first on Supabase without a sync service: a local PGlite database, two-way sync through the Data API and Realtime, and your RLS policies as the sync rules.',
       social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/aboviq/supapower' }],
       components: {
         SiteTitle: './src/components/SiteTitle.astro',
       },
       sidebar: [
+        { label: 'Why Supapower', link: '/why-supapower/' },
+        { label: 'Comparison', link: '/comparison/' },
         { label: 'Packages', items: [{ autogenerate: { directory: 'packages' } }] },
         { label: 'Guides', items: [{ autogenerate: { directory: 'guides' } }] },
         { label: 'Examples', link: '/examples/' },

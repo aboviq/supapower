@@ -1,0 +1,110 @@
+---
+title: Comparison
+description: How Supapower compares with PowerSync, Electric and Zero - architecture, authorization, write path, conflicts and licensing.
+---
+
+All four solve the same problem - read and write locally, converge later - and differ in what you
+have to run, what the client stores, and who decides what a client may see. One note before the
+table: Supapower builds on [PGlite](https://pglite.dev/), which is an Electric SQL project, but
+does **not** use Electric's sync service - the two are unrelated beyond sharing that dependency.
+
+{/* Make the dimension column (first column) stand out and stay put while the table scrolls. */}
+
+<style>{`
+  .sl-markdown-content table th:first-child,
+  .sl-markdown-content table td:first-child {
+    position: sticky;
+    left: 0;
+    background: var(--sl-color-bg);
+    color: var(--sl-color-white);
+    font-weight: 600;
+    border-inline-end: 1px solid var(--sl-color-gray-5);
+  }
+`}</style>
+
+|                             | Supapower                                                     | PowerSync                                                                | Electric                                           | Zero                                                         |
+| --------------------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------ | -------------------------------------------------- | ------------------------------------------------------------ |
+| Extra service to run        | None - Supabase's Data API and Realtime                       | PowerSync Service (cloud or self-hosted)                                 | Electric sync service (cloud or self-hosted)       | `zero-cache` server (cloud or self-hosted)                   |
+| Access to your database     | None beyond the Supabase client (HTTPS + websocket)           | Logical replication connection to your database                          | Logical replication connection to your Postgres    | Logical replication connection to your Postgres              |
+| Local store                 | PGlite - Postgres compiled to WASM                            | SQLite                                                                   | Your choice; PGlite, TanStack DB or plain JS state | Its own client store                                         |
+| Backends supported          | Supabase only                                                 | Postgres, MongoDB, MySQL, SQL Server and more                            | Any Postgres with logical replication              | Any Postgres with logical replication                        |
+| Direction                   | Two-way                                                       | Two-way                                                                  | Read path only - you build the write path          | Two-way                                                      |
+| What a client may sync      | Your RLS policies, unchanged                                  | Sync Streams, configured separately from RLS                             | Shapes, scoped by your auth proxy                  | ZQL queries plus permission rules in app code                |
+| Write path                  | Queued locally, upserted through PostgREST                    | Your own upload endpoint (`uploadData`)                                  | Your own API                                       | Custom mutators on the server                                |
+| Conflict model              | Per-column merge in Postgres, last-write-wins within a column | Server-authoritative, last-write-wins per field                          | Yours to define                                    | Server-authoritative; optimistic client state is rolled back |
+| Partial sync of a big table | No - a table syncs whole, minus what RLS hides                | Yes - Sync Streams                                                       | Yes - Shapes                                       | Yes - queries                                                |
+| Client platforms            | Web, Node, Bun, Deno (JS/TS)                                  | Web, React Native, Flutter, Kotlin, Swift                                | Web and anything that can speak its HTTP API       | Web                                                          |
+| License                     | Apache-2.0                                                    | SDKs Apache-2.0; service under FSL 1.1 with an Apache-2.0 future license | Apache-2.0                                         | Apache-2.0                                                   |
+| Cost model                  | Only what Supabase already costs you                          | Free tier, then metered usage                                            | Free self-hosted; metered cloud                    | Free self-hosted; per-instance cloud                         |
+| Maturity                    | Pre-1.0, no commercial support                                | Production, commercial support                                           | Production, commercial support                     | 1.0, commercial support                                      |
+
+## Reading the table
+
+**[PowerSync](https://www.powersync.com/)** is the closest relative and Supapower's stated
+inspiration - it's also
+[Supabase's own listed offline-first integration](https://docs.powersync.com/integrations/supabase/guide).
+Choose it for non-Supabase or non-Postgres backends, native mobile SDKs, [Sync Streams](https://docs.powersync.com/sync/streams/overview)
+that carve a large table into per-user buckets, or paid support and uptime SLAs. Supapower's trade:
+no service to run, no replication slot on your database, and RLS instead of a second rules
+language to maintain.
+
+**[Electric](https://electric.ax/sync/)** is a read-path sync engine: [Shapes](https://electric.ax/docs/sync/guides/shapes)
+delivered over HTTP and cached by a CDN, deliberately leaving [writes](https://electric.ax/docs/sync/guides/writes)
+to the application to design. Choose it for large read-heavy fan-out, or a Postgres that is not
+Supabase. Supapower ships the write path instead - the queue, the retries, the per-column conflict
+rules - so there's nothing left to build.
+
+**[Zero](https://zero.rocicorp.dev/)** syncs whatever a [query](https://zero.rocicorp.dev/docs/queries)
+asks for and applies writes through server-authoritative [mutators](https://zero.rocicorp.dev/docs/mutators) -
+closest to "your backend, but instant". Choose it when authorization and mutation logic belong in
+server code and the working set is a query, not a table. Supapower's authorization is the
+database's own: no second permission model to write.
+
+## Partial sync in detail
+
+In all three cases it does come down to a filter attached to a table - what differs is who writes
+the filter, and whether a client can change it at runtime.
+
+- **PowerSync** - a stream is a SQL-like query in a YAML config deployed to the service, e.g.
+  `SELECT * FROM lists WHERE owner_id = auth.user_id()`. Filters take parameters from the token,
+  the connection or the client's own subscription, and each distinct parameter value becomes a
+  bucket that syncs as a unit. See [Sync Streams](https://docs.powersync.com/sync/streams/overview).
+- **Electric** - a shape is one table plus an optional `where` clause and `columns` list, requested
+  over HTTP; subqueries cover membership and sharing rules
+  (`id IN (SELECT user_id FROM memberships WHERE org_id = $1)`). Shape definitions are immutable,
+  and production apps are expected to have their backend issue them so a client cannot widen its
+  own filter. See [Shapes](https://electric.ax/docs/sync/guides/shapes).
+- **Zero** - filters are ordinary queries in application code. `zero-cache` asks your server to
+  resolve each query by name, which is where it can be narrowed further for permissions, and a
+  query can pull in relationships, so the unit is a query result rather than a single table. See
+  [Queries](https://zero.rocicorp.dev/docs/queries).
+
+Supapower has no equivalent knob. A tracked table is downloaded whole - the request selects the
+columns the local schema knows, orders by primary key and pages through, narrowed only by the
+[`cursor`](/packages/supapower/#table-cursor-configuration) watermark, which limits how far back in
+time it reads rather than which rows qualify. The realtime subscription binds to a schema and table
+with no filter either.
+
+What a client actually ends up holding is whatever its RLS policies return, so the lever for "this
+client should only have its own rows" is the policy, not a per-client filter. When a table is
+bigger than the narrowest slice a policy can express, the workaround is to split the hot subset
+into its own table - optionally in a
+[separate schema](/packages/supapower/#table-schema-configuration) - and track that instead.
+
+## Also in the field
+
+- [RxDB](https://rxdb.info/replication-supabase.html) - a JS reactive database with a first-party
+  Supabase replication plugin (PostgREST pull/push, Realtime for live updates), storing locally in
+  IndexedDB rather than a real Postgres.
+- [WatermelonDB](https://watermelondb.dev/) - a SQLite-backed reactive database for React and
+  React Native; you implement the sync backend yourself against its pull/push protocol.
+- [LiveStore](https://docs.livestore.dev/) - an event-sourced SQLite store with pluggable sync
+  backends (Cloudflare Durable Objects first-party).
+- [Triplit](https://www.triplit.dev/) - a full-stack syncing database with CRDT-based conflict
+  resolution, requiring its own server (`@triplit/server`).
+- [Verdant](https://verdant.dev/) - an IndexedDB store plus a small Node and SQLite sync server of
+  its own, MIT-licensed and openly experimental; it replaces the backend rather than syncing an
+  existing Supabase one, which is why it is not in the table above.
+
+_Checked against the linked docs in September 2026. Sync engines move fast - follow the link before
+betting on a row._

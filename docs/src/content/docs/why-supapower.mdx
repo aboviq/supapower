@@ -1,0 +1,93 @@
+---
+title: Why Supapower
+description: What Supapower does that a sync service does not, what it costs you, and when another sync engine is the better fit.
+---
+
+import { LinkButton } from '@astrojs/starlight/components';
+
+Supabase gives an app Postgres, auth, RLS and realtime, but no story for reading and writing while
+offline. The usual answer is a second sync service in front of the database, with its own
+deployment, its own authorization rules and its own bill. Supapower takes the other route: treat
+the Data API and Realtime as the sync protocol and keep a real Postgres on the client.
+
+## The six things that make it different
+
+### Nothing new to deploy
+
+Supabase's Data API and Realtime _are_ the sync protocol - no sync service, no replication slot,
+no second bill. There is no logical-replication slot to open on the Supabase database, no service
+to run in CI, staging and production, and no extra vendor sitting in the data path. See
+[how it works](/packages/supapower/#how-it-works) for the mechanics.
+
+### Real Postgres on both ends
+
+The client is [PGlite](https://pglite.dev/) - Electric SQL's WASM build of Postgres - not SQLite:
+the same SQL, the same types, and migrations you can lift from the server almost as-is. The
+tradeoff is size: a WASM Postgres is heavier to ship than an embedded SQLite. See
+[database migrations](/guides/database-migrations/) for the schema relaxations that keep a client
+schema forward and backward compatible with the server's.
+
+### Your RLS policies are the sync rules
+
+Downloads and writes go through PostgREST as the signed-in user, so there is no second
+authorization language to keep in step with your policies. A client can only download what its RLS
+policies allow and can only write what they allow - a denied write surfaces as `update_ignored` or
+`delete_ignored` rather than silently succeeding, see [the error event](/packages/supapower/#the-error-event).
+Tables that should sync to signed-out visitors too are marked `access: 'anon'`.
+
+### Two-way sync that merges per column
+
+Offline writes queue per transaction and upload only the columns that changed, so two people
+editing different fields of a row both keep their edit - see [Conflicts](/packages/supapower/#conflicts)
+for the full model. The limit is in the same breath: two edits to the _same_ column resolve last
+write wins, a delete beats a concurrent edit, and this is not a CRDT - there is no text merging.
+
+### Three lines to adopt
+
+A PGlite extension plus one `sync()` call - no codegen, no schema DSL, no client-side query
+language to learn:
+
+```ts
+await pg.supapower.sync({
+  supabase,
+  tables: ['items', { table: 'notes', cursor: 'updated_at' }],
+});
+```
+
+See [`supapower.sync`](/packages/supapower/#supapowersync) for every option.
+
+### Small, permissive, batteries included
+
+Apache-2.0 with zero runtime dependencies, plus a `SharedWorker` multi-tab host
+([`@supapower/worker`](/packages/worker/)), React ([`@supapower/react`](/packages/react/)) and Vue
+([`@supapower/vue`](/packages/vue/)) bindings, and a typed
+[status](/packages/supapower/#supapowerstatus) and event API.
+
+## What it costs you
+
+- Supabase only, by design. Nothing here works against a plain Postgres.
+- Sync granularity is the table, filtered by RLS - there is no
+  [per-query shape or stream](/comparison/#partial-sync-in-detail). A client that may see a million
+  rows will eventually hold a million rows.
+- Without a [`cursor`](/packages/supapower/#table-cursor-configuration) column every start
+  downloads each table whole; with one, the download is incremental but hard `DELETE`s never reach
+  clients that were offline - see [database migrations](/guides/database-migrations/) for the
+  soft-delete convention.
+- The realtime path is Supabase Realtime's
+  [`postgres_changes`](https://supabase.com/docs/guides/realtime/postgres-changes), so its
+  delivery and scaling characteristics are yours too.
+- Single-column primary keys only; compound primary keys are not implemented.
+- Unsynced local writes to `authenticated` tables are dropped on sign-out.
+- Conflict resolution is per-column last-write-wins, not a CRDT: no text merging.
+- Pre-1.0 (`0.3.0`). Both directions work; the public API may still change. No commercial support.
+
+## When something else fits better
+
+- A backend that is not Supabase - a self-hosted Postgres, MongoDB, MySQL - or native mobile SDKs
+  (Flutter, Kotlin, Swift): **PowerSync**.
+- Read-path sync at CDN scale, or a Postgres that is not Supabase, with a write path you design
+  yourself: **Electric**.
+- Per-query partial sync of a large dataset with server-authoritative mutators: **Zero**.
+- A managed service with an SLA and paid support: PowerSync Cloud or Electric Cloud.
+
+<LinkButton href="/comparison/">See the full comparison</LinkButton>
