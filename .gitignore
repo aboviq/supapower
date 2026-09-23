@@ -4,6 +4,7 @@ coverage/
 *.tsbuildinfo
 .astro/
 docs/src/content/docs/packages/
+docs/src/content/docs/guides/
 
 .env
 .env.*

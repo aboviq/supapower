@@ -7,7 +7,7 @@
   "type": "module",
   "scripts": {
     "build": "bun run sync:readmes && bunx --bun astro build",
-    "clean": "rm -rf dist .astro src/content/docs/packages",
+    "clean": "rm -rf dist .astro src/content/docs/packages src/content/docs/guides",
     "dev": "bun run sync:readmes && bunx --bun astro dev",
     "preview": "bunx --bun astro preview",
     "typecheck": "tsc --project tsconfig.json",
