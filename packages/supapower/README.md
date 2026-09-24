@@ -26,7 +26,7 @@ local PGlite database in sync with Supabase inspired by PowerSync.
 - **Small, permissive, batteries included** - Apache-2.0 with zero runtime dependencies, plus a
   `SharedWorker` multi-tab host, React and Vue bindings, and a typed status and event API.
 
-Longer version, and how it compares with PowerSync, Electric and Zero:
+Longer version, and how it compares with RxDB, PowerSync, Electric and Zero:
 [supapower.dev/why-supapower](https://supapower.dev/why-supapower/) ·
 [supapower.dev/comparison](https://supapower.dev/comparison/)
 

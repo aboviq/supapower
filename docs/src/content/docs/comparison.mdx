@@ -1,9 +1,9 @@
 ---
 title: Comparison
-description: How Supapower compares with PowerSync, Electric and Zero - architecture, authorization, write path, conflicts and licensing.
+description: How Supapower compares with RxDB, PowerSync, Electric and Zero - architecture, authorization, write path, conflicts and licensing.
 ---
 
-All four solve the same problem - read and write locally, converge later - and differ in what you
+All five solve the same problem - read and write locally, converge later - and differ in what you
 have to run, what the client stores, and who decides what a client may see. One note before the
 table: Supapower builds on [PGlite](https://pglite.dev/), which is an Electric SQL project, but
 does **not** use Electric's sync service - the two are unrelated beyond sharing that dependency.
@@ -22,25 +22,39 @@ does **not** use Electric's sync service - the two are unrelated beyond sharing 
   }
 `}</style>
 
-|                             | Supapower                                                     | PowerSync                                                                | Electric                                           | Zero                                                         |
-| --------------------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------ | -------------------------------------------------- | ------------------------------------------------------------ |
-| Extra service to run        | None - Supabase's Data API and Realtime                       | PowerSync Service (cloud or self-hosted)                                 | Electric sync service (cloud or self-hosted)       | `zero-cache` server (cloud or self-hosted)                   |
-| Access to your database     | None beyond the Supabase client (HTTPS + websocket)           | Logical replication connection to your database                          | Logical replication connection to your Postgres    | Logical replication connection to your Postgres              |
-| Local store                 | PGlite - Postgres compiled to WASM                            | SQLite                                                                   | Your choice; PGlite, TanStack DB or plain JS state | Its own client store                                         |
-| Backends supported          | Supabase only                                                 | Postgres, MongoDB, MySQL, SQL Server and more                            | Any Postgres with logical replication              | Any Postgres with logical replication                        |
-| Direction                   | Two-way                                                       | Two-way                                                                  | Read path only - you build the write path          | Two-way                                                      |
-| What a client may sync      | Your RLS policies, unchanged                                  | Sync Streams, configured separately from RLS                             | Shapes, scoped by your auth proxy                  | ZQL queries plus permission rules in app code                |
-| Write path                  | Queued locally, upserted through PostgREST                    | Your own upload endpoint (`uploadData`)                                  | Your own API                                       | Custom mutators on the server                                |
-| Conflict model              | Per-column merge in Postgres, last-write-wins within a column | Server-authoritative, last-write-wins per field                          | Yours to define                                    | Server-authoritative; optimistic client state is rolled back |
-| Partial sync of a big table | No - a table syncs whole, minus what RLS hides                | Yes - Sync Streams                                                       | Yes - Shapes                                       | Yes - queries                                                |
-| Client platforms            | Web, Node, Bun, Deno (JS/TS)                                  | Web, React Native, Flutter, Kotlin, Swift                                | Web and anything that can speak its HTTP API       | Web                                                          |
-| License                     | Apache-2.0                                                    | SDKs Apache-2.0; service under FSL 1.1 with an Apache-2.0 future license | Apache-2.0                                         | Apache-2.0                                                   |
-| Cost model                  | Only what Supabase already costs you                          | Free tier, then metered usage                                            | Free self-hosted; metered cloud                    | Free self-hosted; per-instance cloud                         |
-| Maturity                    | Pre-1.0, no commercial support                                | Production, commercial support                                           | Production, commercial support                     | 1.0, commercial support                                      |
+|                             | Supapower                                                       | RxDB + Supabase plugin                                             | PowerSync                                                                | Electric                                           | Zero                                                         |
+| --------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------ | -------------------------------------------------- | ------------------------------------------------------------ |
+| Extra service to run        | None - Supabase's Data API and Realtime                         | None - the same Data API and Realtime                              | PowerSync Service (cloud or self-hosted)                                 | Electric sync service (cloud or self-hosted)       | `zero-cache` server (cloud or self-hosted)                   |
+| Access to your database     | None beyond the Supabase client (HTTPS + websocket)             | None beyond the Supabase client (HTTPS + websocket)                | Logical replication connection to your database                          | Logical replication connection to your Postgres    | Logical replication connection to your Postgres              |
+| Local store                 | PGlite - Postgres compiled to WASM                              | Pluggable; localStorage and Dexie free, IndexedDB/OPFS/SQLite paid | SQLite                                                                   | Your choice; PGlite, TanStack DB or plain JS state | Its own client store                                         |
+| Local queries               | SQL (PostgreSQL)                                                | Mango-style selectors over JSON documents                          | SQL (SQLite)                                                             | Whatever your client store offers                  | ZQL                                                          |
+| Backends supported          | Supabase only                                                   | Supabase, CouchDB, GraphQL, Firestore or any HTTP backend          | Postgres, MongoDB, MySQL, SQL Server and more                            | Any Postgres with logical replication              | Any Postgres with logical replication                        |
+| Direction                   | Two-way                                                         | Two-way                                                            | Two-way                                                                  | Read path only - you build the write path          | Two-way                                                      |
+| What a client may sync      | Your RLS policies, unchanged                                    | Your RLS policies, plus a client-side pull query                   | Sync Streams, configured separately from RLS                             | Shapes, scoped by your auth proxy                  | ZQL queries plus permission rules in app code                |
+| Write path                  | Queued locally, upserted through PostgREST                      | Queued locally, pushed through PostgREST with concurrency guards   | Your own upload endpoint (`uploadData`)                                  | Your own API                                       | Custom mutators on the server                                |
+| Conflict model              | Per-column merge in Postgres, last-write-wins within a column   | Per document; the server version wins unless you write a handler   | Server-authoritative, last-write-wins per field                          | Yours to define                                    | Server-authoritative; optimistic client state is rolled back |
+| Partial sync of a big table | No - a table syncs whole, minus what RLS hides                  | Yes - pull query filters                                           | Yes - Sync Streams                                                       | Yes - Shapes                                       | Yes - queries                                                |
+| Demands on your schema      | A single-column primary key; `updated_at` to sync incrementally | String primary keys, plus `_deleted` and `_modified` columns       | Client-side schema in app code                                           | None                                               | None                                                         |
+| Client platforms            | Web, Node, Bun, Deno (JS/TS)                                    | Web, Node, React Native, Electron, Capacitor                       | Web, React Native, Flutter, Kotlin, Swift                                | Web and anything that can speak its HTTP API       | Web                                                          |
+| License                     | Apache-2.0                                                      | Apache-2.0 core; paid license for the faster storages              | SDKs Apache-2.0; service under FSL 1.1 with an Apache-2.0 future license | Apache-2.0                                         | Apache-2.0                                                   |
+| Cost model                  | Only what Supabase already costs you                            | Supabase, plus a per-year license if you need a premium storage    | Free tier, then metered usage                                            | Free self-hosted; metered cloud                    | Free self-hosted; per-instance cloud                         |
+| Maturity                    | Pre-1.0, no commercial support                                  | Production, paid support available                                 | Production, commercial support                                           | Production, commercial support                     | 1.0, commercial support                                      |
 
 ## Reading the table
 
-**[PowerSync](https://www.powersync.com/)** is the closest relative and Supapower's stated
+**[RxDB](https://rxdb.info/replication-supabase.html)** with its Supabase replication plugin is the
+closest architectural match, and the reason the first two rows of the table look identical: it also
+talks straight to Supabase over PostgREST and Realtime, so "nothing to deploy" is not unique to
+Supapower. What differs is the local database and the conflict model. RxDB is a document store
+queried with Mango-style selectors - no SQL, no joins, no Postgres - and conflicts are resolved per
+document, where [the default handler](https://rxdb.info/transactions-conflicts-revisions.html#custom-conflict-handler)
+drops the local version in favor of the server's and merging two edits means writing a handler
+yourself. It also asks your Supabase tables for string primary keys and `_deleted` / `_modified`
+columns. Choose it for a document model, React Native, or one client syncing several kinds of
+backend. Choose Supapower to keep writing SQL against a real Postgres and to get column-level
+merging without writing the merge.
+
+**[PowerSync](https://www.powersync.com/)** is the closest relative in intent and Supapower's stated
 inspiration - it's also
 [Supabase's own listed offline-first integration](https://docs.powersync.com/integrations/supabase/guide).
 Choose it for non-Supabase or non-Postgres backends, native mobile SDKs, [Sync Streams](https://docs.powersync.com/sync/streams/overview)
@@ -62,9 +76,13 @@ database's own: no second permission model to write.
 
 ## Partial sync in detail
 
-In all three cases it does come down to a filter attached to a table - what differs is who writes
-the filter, and whether a client can change it at runtime.
+In every case it does come down to a filter attached to a table - what differs is who writes the
+filter, and whether a client can change it at runtime.
 
+- **RxDB** - the Supabase plugin takes a `pull.queryBuilder`, so the pull is an ordinary PostgREST
+  query you can narrow (`query.eq('status', 'active')`) or point at joined tables. The filter lives
+  in client code, so RLS is still what stops a client from asking for more. See
+  [Supabase replication](https://rxdb.info/replication-supabase.html).
 - **PowerSync** - a stream is a SQL-like query in a YAML config deployed to the service, e.g.
   `SELECT * FROM lists WHERE owner_id = auth.user_id()`. Filters take parameters from the token,
   the connection or the client's own subscription, and each distinct parameter value becomes a
@@ -93,9 +111,6 @@ into its own table - optionally in a
 
 ## Also in the field
 
-- [RxDB](https://rxdb.info/replication-supabase.html) - a JS reactive database with a first-party
-  Supabase replication plugin (PostgREST pull/push, Realtime for live updates), storing locally in
-  IndexedDB rather than a real Postgres.
 - [WatermelonDB](https://watermelondb.dev/) - a SQLite-backed reactive database for React and
   React Native; you implement the sync backend yourself against its pull/push protocol.
 - [LiveStore](https://docs.livestore.dev/) - an event-sourced SQLite store with pluggable sync
