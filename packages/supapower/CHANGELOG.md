@@ -1,5 +1,23 @@
 # supapower
 
+## 0.4.0
+
+### Minor Changes
+
+- [`0aa2b7d`](https://github.com/aboviq/supapower/commit/0aa2b7d249776fd74805908cf30bfbf8f2a04ec2) Thanks [@joakimbeng](https://github.com/joakimbeng)! - Added a `redownload` method to the object `sync()` returns, for a visibility change row-level security decides but no table's `filter` reflects - typically a claim in a refreshed access token. `await sync.redownload(['todos'])` empties that table locally and downloads it whole again, ignoring both the download throttle and any `cursor` watermark; called with no arguments it does every configured table. Neither a download nor a realtime subscription ever reports a row that stopped being visible, so the table has to start from empty to be described completely - the same reason a changed `filter` truncates before it re-downloads.
+  
+  `redownload()` resolves once the request has been recorded and the syncing tab has been woken, not once the data has landed - `downloadTableFinish` or `supapower.status` still report the download itself, the same as any other one. Queued local changes for the table are left alone and still upload.
+
+- [`1f0a2bd`](https://github.com/aboviq/supapower/commit/1f0a2bd4fbcca6ec9495d742871a914450a84540) Thanks [@joakimbeng](https://github.com/joakimbeng)! - Added a `filter` option to a table's configuration, for syncing a subset of its rows. The callback is handed a filter builder and the current session, and the filter it returns narrows both the PostgREST download and the `postgres_changes` subscription: `filter: (filter, session) => filter.eq('workspace_id', session?.user.app_metadata['workspace'])`. Conditions are `AND`ed, and row-level security still decides what the filter is allowed to return.
+  
+  Filters are resolved per session, so an auth event that changes a claim a callback reads - a token refresh included - resolves a different filter and restarts the sync; an auth event that changes nothing is ignored as before. A table whose filter changed is truncated before it is downloaded again, since neither a filtered download nor a filtered subscription ever reports a row that stopped matching. A callback that throws stops that table from downloading and subscribing for that session, reported through the `error` event as the new `filter_failed` code, while its queued changes still upload.
+  
+  The `@supabase/supabase-js` peer range tightens to `^2.116.0`: conditions are serialized through that release's `postgresChangesFilter()` builder, so both ends of the sync agree on how a value is quoted.
+
+### Patch Changes
+
+- [`79b300e`](https://github.com/aboviq/supapower/commit/79b300e3287754df940c64344feb951d20779c53) Thanks [@joakimbeng](https://github.com/joakimbeng)! - Added a "Why Supapower" section to the readme, summarizing what Supapower does that a separate sync service does not, and linking to the new [why](https://supapower.dev/why-supapower/) and [comparison](https://supapower.dev/comparison/) pages on the documentation site. No code changes.
+
 ## 0.3.0
 
 ### Minor Changes
