@@ -401,6 +401,99 @@ describe('createSupapower().sync - initial download', () => {
   });
 });
 
+describe('createSupapower().sync - redownload', () => {
+  const tables = ['todos', { table: 'plans', access: 'anon' as const }];
+
+  let env: FakeLeadershipEnv;
+
+  beforeEach(() => {
+    env = installLeadershipEnv();
+  });
+
+  afterEach(() => {
+    env.restore();
+  });
+
+  const start = async (supabase: FakeSupabase, pg: FakePGlite) => {
+    const sync = await createSupapower(asPGlite(pg)).sync({
+      supabase: asSupabaseClient(supabase),
+      tables,
+    });
+
+    env.locks.grant();
+    await settle();
+
+    return sync;
+  };
+
+  test('redownload of one table empties and re-downloads only it', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase({ user: 'user-a', rows: { todos: [{ id: 1 }] } });
+
+    const sync = await start(supabase, pg);
+
+    expect(await waitFor(() => supabase.calls.includes('select:plans'))).toBe(true);
+    await settle();
+
+    const truncatedBefore = pg.truncated.length;
+    const callsBefore = supabase.calls.length;
+
+    await sync.redownload(['todos']);
+
+    expect(await waitFor(() => supabase.calls.length > callsBefore)).toBe(true);
+    await settle();
+
+    expect(pg.truncated.slice(truncatedBefore)).toEqual(['todos']);
+    expect(supabase.calls.slice(callsBefore)).toContain('select:todos');
+    expect(supabase.calls.slice(callsBefore)).not.toContain('select:plans');
+
+    sync.unsubscribe();
+  });
+
+  test('redownload() covers every configured table', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase({ user: 'user-a', rows: { todos: [{ id: 1 }] } });
+
+    const sync = await start(supabase, pg);
+
+    expect(await waitFor(() => supabase.calls.includes('select:plans'))).toBe(true);
+    await settle();
+
+    const truncatedBefore = pg.truncated.length;
+    const callsBefore = supabase.calls.length;
+
+    await sync.redownload();
+
+    expect(await waitFor(() => supabase.calls.length > callsBefore)).toBe(true);
+    await settle();
+
+    const added = supabase.calls.slice(callsBefore);
+
+    expect(added).toContain('select:todos');
+    expect(added).toContain('select:plans');
+    expect(pg.truncated.slice(truncatedBefore)).toContain('todos');
+
+    sync.unsubscribe();
+  });
+
+  test('an unknown table name is rejected', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase({ user: 'user-a' });
+
+    const sync = await start(supabase, pg);
+
+    expect(await waitFor(() => supabase.calls.includes('select:plans'))).toBe(true);
+
+    const truncatedBefore = pg.truncated.length;
+    const thrown = await sync.redownload(['nope']).catch((error: unknown) => error);
+
+    expect(isSupapowerError(thrown) && thrown.code).toBe('schema_mismatch');
+    expect(pg.truncated.length).toBe(truncatedBefore);
+
+    sync.unsubscribe();
+  });
+});
+
 describe('createSupapower().sync - waiting for authentication', () => {
   const tables = ['todos', { table: 'plans', access: 'anon' as const }];
 

@@ -231,6 +231,34 @@ export interface SupapowerSync {
   readonly leadership: LeadershipStrategy;
 
   /**
+   * Empties the named tables locally and downloads them whole again, ignoring
+   * both the download throttle and any `cursor` watermark.
+   *
+   * For a visibility change the client cannot see: row-level security decides
+   * what a token may read, so a token whose claims changed can widen or narrow
+   * the rows this user gets without any table's `filter` changing. Neither a
+   * download nor a realtime subscription ever reports a row that stopped being
+   * visible, so the table has to start from empty to be described completely.
+   *
+   * Call it from the application's own `onAuthStateChange` handler when a claim
+   * the policies read has changed - not on every `TOKEN_REFRESHED`, which
+   * arrives hourly and would re-download everything each time.
+   *
+   * Queued local changes are kept and still upload.
+   *
+   * Resolves once the request has been recorded and the tab that is downloading
+   * has been woken, not once the data has landed: downloads run on one tab
+   * only, which may be another one. Follow the progress through
+   * `downloadTableFinish` or `supapower.status`.
+   *
+   * @param tables Tables to redownload, named as configured - `"todos"`, or
+   *   `"app.todos"` for a table whose bare name is configured in more than one
+   *   schema. Throws a `SupapowerError` with code `schema_mismatch` for a name
+   *   no configured table answers to. Every configured table when left out.
+   */
+  redownload(tables?: readonly string[]): Promise<void>;
+
+  /**
    * Unsubscribes from the ongoing sync, stopping any further synchronization of data with the remote tables.
    *
    * Local changes will still be tracked but the queue of outgoing changes will no longer be processed.

@@ -1,11 +1,14 @@
 import type { PGliteInterface } from '@electric-sql/pglite';
+import { raw } from '@electric-sql/pglite/template';
 import type { Session, SupabaseClient } from '@supabase/supabase-js';
 
 import type { UnrecoverableUploadError } from './changes.js';
+import { REFRESH_CHANNEL } from './constants.js';
 import { asSupapowerError } from './errors.js';
 import { createSupapowerEvents, SupapowerErrorEvent, type SupapowerEventTarget } from './events.js';
 import { resolveFilters, type ResolvedFilters } from './filter.js';
 import { createLeadership } from './leadership.js';
+import { requestTableRefresh } from './metadata.js';
 import { readLocalColumns, runMigrations, trackTables } from './migrations.js';
 import { trackStatus } from './status.js';
 import {
@@ -14,6 +17,7 @@ import {
   resolveTables,
   runIncomingSync,
   runOutgoingSync,
+  tableKey,
   tablesForSession,
   withLocalColumns,
 } from './sync.js';
@@ -283,7 +287,20 @@ export function createSupapower(pg: PGliteInterface): SupapowerNamespace {
         await draining;
       };
 
-      const handle: SupapowerSync = { leadership: leadership.strategy, unsubscribe };
+      const redownload = async (only?: readonly string[]): Promise<void> => {
+        if (stopped) {
+          return;
+        }
+
+        await requestTableRefresh(
+          pg,
+          only ? only.map((name) => tableKey(configs, name)) : [...configs.keys()],
+        );
+
+        await pg.sql`SELECT pg_notify(${raw`'${REFRESH_CHANNEL}'`}, '')`;
+      };
+
+      const handle: SupapowerSync = { leadership: leadership.strategy, redownload, unsubscribe };
 
       if (signal?.aborted) {
         stopped = true;

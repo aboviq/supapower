@@ -17,7 +17,7 @@ import {
   type UnrecoverableUploadError,
   type UpdateChange,
 } from './changes.js';
-import { CHANGES_CHANNEL } from './constants.js';
+import { CHANGES_CHANNEL, REFRESH_CHANNEL } from './constants.js';
 import {
   asSupapowerError,
   isUnrecoverableUploadError,
@@ -33,6 +33,7 @@ import {
 import { applyFilter, type ResolvedFilters } from './filter.js';
 import {
   clearTableSyncState,
+  getRefreshRequest,
   getSyncedUser,
   getTableSyncState,
   setSyncedUser,
@@ -101,6 +102,33 @@ const localName = ({ localSchema, table }: ResolvedTableConfig): string =>
  */
 const remoteName = ({ schema, table }: ResolvedTableConfig): string =>
   escapeIdentifier(schema, table);
+
+/**
+ * The local key for a table named the way the application configured it:
+ * `"todos"`, or `"app.todos"` when the same table name is configured in more
+ * than one remote schema.
+ */
+export function tableKey(tables: Map<string, ResolvedTableConfig>, name: string): string {
+  const matches = [...tables].filter(
+    ([, config]) =>
+      name === config.table
+      || name === `${config.schema}.${config.table}`
+      || name === escapeIdentifier(config.schema, config.table),
+  );
+
+  const [first] = matches;
+
+  if (matches.length !== 1 || !first) {
+    throw new SupapowerError(
+      matches.length === 0
+        ? `No table named "${name}" is configured for syncing`
+        : `"${name}" matches more than one configured table; name it as "<schema>.<table>"`,
+      { code: 'schema_mismatch' },
+    );
+  }
+
+  return first[0];
+}
 
 /**
  * Fills in the defaults for each table entry and keys them by {@link localName}.
@@ -786,7 +814,15 @@ async function downloadTable({
   const name = localName(config);
 
   const stored = await getTableSyncState(pg, name);
-  const previous = stillApplies(stored, config) ? stored : null;
+  const requested = await getRefreshRequest(pg, name);
+
+  // A redownload asked for since the last completed download. Compared for
+  // equality, not recency: the token that finished a download is the only one
+  // that counts as answered, so a request that lands while that download is
+  // in flight is still pending afterwards.
+  const pending = requested !== undefined && requested !== stored?.refresh;
+
+  const previous = !pending && stillApplies(stored, config) ? stored : null;
   const age = previous ? Date.now() - previous.downloadedAt : Number.NaN;
 
   // A download that still answers this configuration and finished inside the
@@ -799,6 +835,14 @@ async function downloadTable({
   }
 
   events.dispatchEvent(new SupapowerTableEvent('downloadTableStart', config));
+
+  if (pending) {
+    // Neither a filtered download nor RLS ever reports a row that stopped
+    // being visible, so a redownload can only describe the table completely
+    // by starting from empty. TRUNCATE fires TRUNCATE triggers only, so this
+    // does not queue itself up as a pile of outgoing deletes.
+    await pg.query(`TRUNCATE TABLE ${name}`);
+  }
 
   // Taken before the request so a change made while it is in flight is dated
   // after the snapshot rather than swallowed by it.
@@ -914,6 +958,7 @@ async function downloadTable({
     ...(cursor === undefined ? {} : { cursor }),
     ...(highest === null ? {} : { at: highest }),
     ...(resolvedFilter === null ? {} : { filter: resolvedFilter.expression }),
+    ...(requested === undefined ? {} : { refresh: requested }),
   });
 
   events.dispatchEvent(new SupapowerTableEvent('downloadTableFinish', config));
@@ -1133,39 +1178,56 @@ export async function runIncomingSync({
     );
   }
 
-  // Guards against a re-subscribe starting a second retry loop while one is
-  // already working through the same download; `download()` never rejects, so
-  // every call site can fire it without awaiting.
+  // Guards against a second retry loop working through the same download at
+  // the same time; `download()` never rejects, so every call site can fire it
+  // without awaiting.
   let downloading = false;
+
+  // Whether another pass was asked for while one was running, and whether that
+  // pass has to ignore the throttle.
+  let again = false;
+  let againForced = false;
 
   const download = async (force = false): Promise<void> => {
     if (downloading) {
+      again = true;
+      againForced ||= force;
+
       return;
     }
 
     downloading = true;
 
     try {
-      for (let attempt = 0; !signal.aborted; attempt += 1) {
-        if (
-          await enqueue(() =>
-            runInitialSync({
-              pg,
-              supabase,
-              tables,
-              signal,
-              events,
-              downloadThrottle: force ? 0 : downloadThrottle,
-            }),
-          )
-        ) {
-          return;
+      let forced = force;
+
+      do {
+        again = false;
+        againForced = false;
+
+        for (let attempt = 0; !signal.aborted; attempt += 1) {
+          if (
+            await enqueue(() =>
+              runInitialSync({
+                pg,
+                supabase,
+                tables,
+                signal,
+                events,
+                downloadThrottle: forced ? 0 : downloadThrottle,
+              }),
+            )
+          ) {
+            break;
+          }
+
+          // Outside `enqueue`, so realtime changes keep applying between
+          // attempts; only the attempt itself occupies the `applying` chain.
+          await backOff(signal, attempt);
         }
 
-        // Outside `enqueue`, so realtime changes keep applying between
-        // attempts; only the attempt itself occupies the `applying` chain.
-        await backOff(signal, attempt);
-      }
+        forced = againForced;
+      } while (again && !signal.aborted);
     } finally {
       downloading = false;
     }
@@ -1224,6 +1286,13 @@ export async function runIncomingSync({
     });
   });
 
+  // A `redownload()` from any tab: the request itself is already in the
+  // database, so this is only a wake - a tab that starts downloading later
+  // honours it on its own.
+  const unlisten = await pg.listen(REFRESH_CHANNEL, () => {
+    download();
+  });
+
   // Subscribe first, download second: a change made while the snapshot is in
   // flight arrives on the open channel and queues up behind it, rather than
   // falling in the gap between the two.
@@ -1239,7 +1308,11 @@ export async function runIncomingSync({
     // `allSettled`, not `all`: a rejected `removeChannel()` must not cut the
     // wait for `applying` short - the caller awaits this to know teardown is
     // done, including changes still mid-apply.
-    const [removed] = await Promise.allSettled([supabase.removeChannel(subscription), applying]);
+    const [removed] = await Promise.allSettled([
+      supabase.removeChannel(subscription),
+      applying,
+      unlisten(),
+    ]);
 
     if (removed.status === 'rejected') {
       // Reported, not thrown: the caller awaits this to know the teardown is

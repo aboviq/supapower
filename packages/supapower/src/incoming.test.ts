@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
+import { REFRESH_CHANNEL } from './constants.js';
 import type { SupapowerError } from './errors.js';
 import { createSupapowerEvents } from './events.js';
 import { runIncomingSync } from './sync.js';
@@ -453,6 +454,84 @@ describe('runIncomingSync - retrying a failed download', () => {
     expect(supabase.calls.filter((call) => call === 'select:todos').length).toBeGreaterThanOrEqual(
       2,
     );
+
+    controller.abort();
+    await running;
+  });
+});
+
+describe('runIncomingSync - refresh requests', () => {
+  test('a refresh notification triggers another download pass', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase();
+    const controller = new AbortController();
+
+    const running = runIncomingSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: controller.signal,
+    });
+
+    expect(await waitFor(() => supabase.calls.includes('select:tags'))).toBe(true);
+    await settle();
+
+    const before = supabase.calls.length;
+
+    pg.metadata.set('RefreshRequests', { '"public"."todos"': 'tok-1' });
+    pg.notify(REFRESH_CHANNEL);
+
+    expect(await waitFor(() => supabase.calls.length > before)).toBe(true);
+    expect(supabase.calls.slice(before)).toContain('select:todos');
+    expect(pg.truncated).toContain('todos');
+
+    controller.abort();
+    await running;
+  });
+
+  test('a request written during a stalled retry is honoured once, even if notified twice', async () => {
+    let todosAttempts = 0;
+    const supabase = createFakeSupabase({
+      downloadError: (table) => {
+        if (table !== 'todos') {
+          return null;
+        }
+
+        todosAttempts += 1;
+
+        return todosAttempts === 1 ? { code: '50000', message: 'boom' } : null;
+      },
+    });
+    const pg = createFakePGlite();
+    const controller = new AbortController();
+
+    const running = runIncomingSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables,
+      signal: controller.signal,
+    });
+
+    expect(await waitFor(() => supabase.calls.includes('select:todos'))).toBe(true);
+
+    // Still inside the real backoff before the retry: `download()` is
+    // genuinely in progress, so both notifications below have to queue a
+    // repeat rather than running a second overlapping pass or losing the
+    // request entirely.
+    pg.metadata.set('RefreshRequests', { '"public"."tags"': 'tok-1' });
+    pg.notify(REFRESH_CHANNEL);
+    pg.notify(REFRESH_CHANNEL);
+
+    await Bun.sleep(1100);
+
+    expect(await waitFor(() => supabase.calls.includes('select:tags'))).toBe(true);
+    await settle();
+
+    expect(pg.truncated.filter((table) => table === 'tags')).toEqual(['tags']);
+    expect(
+      (pg.metadata.get('TableSyncState') as Record<string, { refresh?: string }>)['"public"."tags"']
+        ?.refresh,
+    ).toBe('tok-1');
 
     controller.abort();
     await running;

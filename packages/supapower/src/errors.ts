@@ -19,7 +19,7 @@ export type SupapowerErrorCode =
   | 'download_failed'
   /** A table's filter callback failed, so the table is not syncing. */
   | 'filter_failed'
-  /** A queued change names a table that is not configured for syncing. */
+  /** Something names a table that is not configured for syncing. */
   | 'schema_mismatch'
   /** Supabase accepted an `UPDATE` that matched no row. */
   | 'update_ignored'

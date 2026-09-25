@@ -22,7 +22,9 @@ export interface FakePGlite {
   sql: FakeSql;
   query: FakeQuery;
   transaction<T>(callback: (tx: { sql: FakeSql; query: FakeQuery }) => Promise<T>): Promise<T>;
-  listen(): Promise<() => Promise<void>>;
+  listen(channel: string, callback: (payload: string) => void): Promise<() => Promise<void>>;
+  /** Fires every listener registered for `channel`, the way `pg_notify` would. */
+  notify(channel: string, payload?: string): void;
 }
 
 export interface FakePGliteOptions {
@@ -58,6 +60,13 @@ function createBase({ changes = [], columns }: FakePGliteOptions): FakePGlite {
   const queue = [...changes];
   const metadata = new Map<string, unknown>();
   const truncated: string[] = [];
+  const listeners = new Map<string, Set<(payload: string) => void>>();
+
+  const notify = (channel: string, payload = ''): void => {
+    for (const callback of listeners.get(channel) ?? []) {
+      callback(payload);
+    }
+  };
 
   const sql: FakeSql = (strings, ...args) => {
     // `raw` and `identifier` template parts are substituted into the query
@@ -149,6 +158,19 @@ function createBase({ changes = [], columns }: FakePGliteOptions): FakePGlite {
       });
     }
 
+    if (text.startsWith('SELECT value ->>')) {
+      const table = String(values[0]);
+      const key = String(values[1]);
+
+      if (!metadata.has(key)) {
+        return Promise.resolve({ rows: [] });
+      }
+
+      const value = metadata.get(key) as Record<string, string>;
+
+      return Promise.resolve({ rows: [{ token: value[table] ?? null }] });
+    }
+
     if (text.startsWith('INSERT INTO supapower.metadata')) {
       const key = String(values[0]);
       const value: unknown = JSON.parse(String(values[1]));
@@ -171,6 +193,14 @@ function createBase({ changes = [], columns }: FakePGliteOptions): FakePGlite {
       }
 
       metadata.set(key, current);
+    }
+
+    // The channel is a `raw` fragment, inline in the text rather than a
+    // parameter - the same as the real statement `redownload()` issues.
+    const notified = /^SELECT pg_notify\('([^']+)'/.exec(text);
+
+    if (notified?.[1]) {
+      notify(notified[1]);
     }
 
     return Promise.resolve({ rows: [] });
@@ -199,7 +229,19 @@ function createBase({ changes = [], columns }: FakePGliteOptions): FakePGlite {
     sql,
     query,
     transaction: (callback) => callback({ sql, query }),
-    listen: () => Promise.resolve(() => Promise.resolve()),
+    listen: (channel, callback) => {
+      const set = listeners.get(channel) ?? new Set();
+
+      listeners.set(channel, set);
+      set.add(callback);
+
+      return Promise.resolve(() => {
+        set.delete(callback);
+
+        return Promise.resolve();
+      });
+    },
+    notify,
   };
 }
 

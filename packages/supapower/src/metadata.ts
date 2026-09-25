@@ -3,6 +3,7 @@ import type { PGliteInterface, Transaction } from '@electric-sql/pglite';
 const keys = {
   syncedUser: 'SyncedUser',
   tableSyncState: 'TableSyncState',
+  refreshRequests: 'RefreshRequests',
 } as const;
 
 /**
@@ -60,6 +61,8 @@ export interface TableSyncState {
   at?: string;
   /** The filter expression the download ran with, if it had one. */
   filter?: string;
+  /** The refresh token the last completed download honoured, if `redownload()` was ever called for it. */
+  refresh?: string;
 }
 
 /**
@@ -125,4 +128,51 @@ export const clearTableSyncState = async (
     SET value = value - ${tables}::text[]
     WHERE key = ${keys.tableSyncState}
   `;
+};
+
+/**
+ * Asks for the named tables to be emptied and downloaded whole again.
+ *
+ * The token is opaque and only ever compared for equality against the one the
+ * last completed download recorded, so it needs no clock: two tabs with skewed
+ * clocks cannot talk each other's request out of happening.
+ *
+ * @param tables The tables' qualified local names, e.g. `public.todos`.
+ */
+export const requestTableRefresh = async (
+  pg: PGliteInterface | Transaction,
+  tables: readonly string[],
+): Promise<void> => {
+  if (tables.length === 0) {
+    return;
+  }
+
+  const requested = Object.fromEntries(tables.map((table) => [table, crypto.randomUUID()]));
+
+  await pg.sql`
+    INSERT INTO supapower.metadata (
+      key,
+      value
+    )
+    VALUES (
+      ${keys.refreshRequests},
+      ${JSON.stringify(requested)}
+    )
+    ON CONFLICT (key) DO UPDATE SET
+      value = metadata.value || EXCLUDED.value;
+  `;
+};
+
+/** The refresh token last asked for on one table, if it was ever asked for. */
+export const getRefreshRequest = async (
+  pg: PGliteInterface | Transaction,
+  table: string,
+): Promise<string | undefined> => {
+  const { rows } = await pg.sql<{ token: string | null }>`
+    SELECT value ->> ${table} AS token
+    FROM supapower.metadata
+    WHERE key = ${keys.refreshRequests}
+  `;
+
+  return rows[0]?.token ?? undefined;
 };

@@ -273,6 +273,12 @@ interface SupapowerSync {
    */
   readonly leadership: 'visible-tab' | 'web-lock' | 'single-process';
   /**
+   * Empties the named tables locally and downloads them whole again,
+   * ignoring both the download throttle and any `cursor` watermark. Every
+   * configured table when called with no arguments.
+   */
+  redownload(tables?: readonly string[]): Promise<void>;
+  /**
    * Stops the synchronization process. Local changes are still tracked.
    * Resolves once the realtime channel has been left. Never rejects.
    * Safe to call more than once.
@@ -280,6 +286,30 @@ interface SupapowerSync {
   unsubscribe(): Promise<void>;
 }
 ```
+
+Row-level security decides what a signed-in user's token may read, so a claim changing inside it can
+widen or narrow the rows a user gets without any table's [`filter`](#table-filter-configuration)
+changing - `filter` only guards what the client itself asks for, not what the server is in charge of. Call `redownload()` from your own `supabase.auth.onAuthStateChange` handler when a claim
+your policies read has changed, e.g:
+
+```ts
+let lastWorkspace: unknown;
+
+supabase.auth.onAuthStateChange((_event, session) => {
+  const workspace = session?.user.app_metadata['workspace'];
+
+  if (workspace !== lastWorkspace) {
+    lastWorkspace = workspace;
+    sync.redownload();
+  }
+});
+```
+
+`redownload()` truncates the affected tables before downloading them again - neither a download nor a
+realtime subscription ever reports a row that stopped being visible, so the table has to start from
+empty to be correct, the same reason a changed `filter` does. Queued local changes are left alone and still upload.
+It resolves once the redownload request has been recorded and the syncing tab has been woken,
+not once the data has been received - follow `downloadTableFinish` or `supapower.status` for that.
 
 ##### `SupapowerTableConfig` - Tracked tables configuration
 
@@ -433,6 +463,9 @@ A few boundaries follow from how it is applied:
 - **A callback that throws stops that table syncing for that session** and reports `filter_failed`
   (an `in` with an empty list, for one). Use `is(column, null)` on a `NOT NULL` column to sync
   nothing on purpose.
+- **A visibility change row-level security makes on its own - the client never sees a claim change,
+  or does not read it in a `filter` - is not covered here.** Call
+  [`sync.redownload()`](#supapowersync---the-sync-handle) instead.
 
 ### `supapower.events`
 

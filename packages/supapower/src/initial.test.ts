@@ -613,6 +613,104 @@ describe('runInitialSync - incremental with a cursor', () => {
   });
 });
 
+describe('runInitialSync - requested redownloads', () => {
+  const incremental = resolveTablesWith(
+    [
+      { table: 'todos', cursor: 'updated_at' },
+      { table: 'plans', access: 'anon' },
+    ],
+    { todos: ['id', 'updated_at'], plans: ['id'] },
+  );
+
+  const rows = {
+    todos: [
+      { id: 1, updated_at: '2026-01-01T10:00:00.000Z' },
+      { id: 2, updated_at: '2026-01-01T12:00:00.000Z' },
+    ],
+  };
+
+  test('empties and pulls the whole table when a refresh was requested', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase({ rows });
+
+    pg.metadata.set('TableSyncState', {
+      '"public"."todos"': {
+        downloadedAt: Date.now(),
+        columns: ['id', 'updated_at'],
+        cursor: 'updated_at',
+        at: '2026-01-01T12:00:00.000Z',
+      },
+    });
+    pg.metadata.set('RefreshRequests', { '"public"."todos"': 'token-1' });
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables: incremental,
+      signal: live(),
+    });
+
+    expect(pg.truncated).toEqual(['todos']);
+    expect(supabase.calls).toEqual(['select:todos', 'select:todos', 'select:plans']);
+    expect(
+      (pg.metadata.get('TableSyncState') as Record<string, { refresh?: string }>)[
+        '"public"."todos"'
+      ]?.refresh,
+    ).toBe('token-1');
+  });
+
+  test('does not honour the same request twice', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase({ rows });
+
+    pg.metadata.set('RefreshRequests', { '"public"."todos"': 'token-1' });
+
+    const run = () =>
+      runInitialSync({
+        pg: asPGlite(pg),
+        supabase: asSupabaseClient(supabase),
+        tables: incremental,
+        signal: live(),
+        downloadThrottle: 0,
+      });
+
+    await run();
+    await run();
+
+    expect(pg.truncated).toEqual(['todos']);
+    expect(supabase.calls).toEqual([
+      'select:todos',
+      'select:todos',
+      'select:plans',
+      'select:todos:gte(updated_at)',
+      'select:todos:gte(updated_at)',
+      'select:plans',
+    ]);
+  });
+
+  test('a table with no request is untouched', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase({ rows });
+
+    pg.metadata.set('RefreshRequests', { '"public"."todos"': 'token-1' });
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables: incremental,
+      signal: live(),
+    });
+
+    expect(pg.truncated).toEqual(['todos']);
+    expect(supabase.calls).toEqual(['select:todos', 'select:todos', 'select:plans']);
+    expect(
+      (pg.metadata.get('TableSyncState') as Record<string, { refresh?: string }>)[
+        '"public"."plans"'
+      ]?.refresh,
+    ).toBeUndefined();
+  });
+});
+
 describe('runInitialSync - schema drift', () => {
   const drifted = resolveTablesWith([{ table: 'todos', cursor: 'updated_at' }], {
     todos: ['id', 'updated_at'],
