@@ -24,11 +24,13 @@ export interface FakeRealtimeChannel {
   readonly name: string;
   /** Every `postgres_changes` binding, as `<schema>.<table>`, in order. */
   readonly bindings: string[];
+  /** The `filter` each binding was given, parallel to `bindings`. */
+  readonly filters: Array<string | undefined>;
   readonly subscribed: boolean;
   readonly removed: boolean;
   on(
     type: string,
-    filter: { event: string; schema: string; table: string },
+    filter: { event: string; schema: string; table: string; filter?: string },
     callback: (payload: ChangePayload) => void,
   ): FakeRealtimeChannel;
   subscribe(callback?: (status: SubscribeStatus, error?: Error) => void): FakeRealtimeChannel;
@@ -73,9 +75,9 @@ export interface FakeSupabase {
   removeChannel(channel: FakeRealtimeChannel): Promise<'ok'>;
   auth: { onAuthStateChange(callback: AuthCallback): AuthSubscription };
   /** Signs a user in or out, notifying the auth listeners. */
-  setUser(userId: string | null): void;
+  setUser(userId: string | null, claims?: Record<string, unknown>): void;
   /** Emits `TOKEN_REFRESHED` for the current session, as auth-js does hourly. */
-  refreshToken(): void;
+  refreshToken(claims?: Record<string, unknown>): void;
 }
 
 interface SelectResult {
@@ -87,13 +89,18 @@ interface SelectResult {
 export interface FakeSelect extends PromiseLike<SelectResult> {
   gte(column: string, value: string): FakeSelect;
   gt(column: string, value: unknown): FakeSelect;
+  filter(column: string, operator: string, value: unknown): FakeSelect;
+  not(column: string, operator: string, value: unknown): FakeSelect;
   order(column: string, options?: { ascending?: boolean }): FakeSelect;
   limit(count: number): FakeSelect;
   /** Type-level on the real builder; here it just keeps the chain going. */
   overrideTypes<_T, _Options = { merge: true }>(): FakeSelect;
 }
 
-type AuthCallback = (event: string, session: { user: { id: string } } | null) => void;
+type AuthCallback = (
+  event: string,
+  session: { user: { id: string } & Record<string, unknown> } | null,
+) => void;
 type AuthSubscription = { data: { subscription: { unsubscribe(): void } } };
 
 export interface FakeSupabaseOptions {
@@ -114,6 +121,8 @@ export interface FakeSupabaseOptions {
   downloadError?: (table: string) => ResponseError | null;
   /** Who is signed in to begin with. */
   user?: string | null;
+  /** Extra fields on the session's `user`, e.g. `{ app_metadata: { workspace: 'a' } }`. */
+  claims?: Record<string, unknown>;
   /**
    * `false` replaces `auth` with the proxy that throws on every access, which
    * is what supabase-js installs for a client built with `accessToken`.
@@ -144,16 +153,17 @@ function createSelect(
   requested: string,
   requestedColumns: string[],
 ): FakeSelect {
-  let filter: string | undefined;
+  let gteColumn: string | undefined;
   let from: string | undefined;
   let gtColumn: string | undefined;
   let gtValue: unknown;
   let orderColumn: string | undefined;
   let limitCount: number | undefined;
+  const conditions: string[] = [];
 
   const select: FakeSelect = {
     gte(column, value) {
-      filter = column;
+      gteColumn = column;
       from = value;
 
       return select;
@@ -161,6 +171,16 @@ function createSelect(
     gt(column, value) {
       gtColumn = column;
       gtValue = value;
+
+      return select;
+    },
+    filter(column, operator, value) {
+      conditions.push(`${column}=${operator}.${value}`);
+
+      return select;
+    },
+    not(column, operator, value) {
+      conditions.push(`${column}=not.${operator}.${value}`);
 
       return select;
     },
@@ -180,12 +200,13 @@ function createSelect(
     // PostgREST's query builder is itself thenable, which is what this stands in for.
     // oxlint-disable-next-line unicorn/no-thenable
     then(onResolved, onRejected) {
-      const column = filter;
+      const column = gteColumn;
       const lowest = from;
 
       const filtered = column === undefined ? '' : `:gte(${column})`;
+      const scoped = conditions.map((condition) => `:filter(${condition})`).join('');
 
-      calls.push(`select:${table}${filtered}`);
+      calls.push(`select:${table}${filtered}${scoped}`);
       schemas.push(schema);
       requestedColumns.push(`${table}:${requested}`);
 
@@ -224,15 +245,18 @@ function createSelect(
 function createChannel(name: string): FakeRealtimeChannel {
   const handlers = new Map<string, (payload: ChangePayload) => void>();
   const bindings: string[] = [];
+  const filters: Array<string | undefined> = [];
   let report: (status: SubscribeStatus, error?: Error) => void = ignoreStatus;
 
   const channel: FakeRealtimeChannel = {
     name,
     bindings,
+    filters,
     subscribed: false,
     removed: false,
     on(_type, filter, callback) {
       bindings.push(`${filter.schema}.${filter.table}`);
+      filters.push(filter.filter);
       handlers.set(`${filter.schema}.${filter.table}`, callback);
 
       return channel;
@@ -269,6 +293,7 @@ export function createFakeSupabase({
   rows = {},
   downloadError = () => null,
   user = null,
+  claims = {},
   auth = true,
   removeChannelError = false,
 }: FakeSupabaseOptions = {}): FakeSupabase {
@@ -279,6 +304,7 @@ export function createFakeSupabase({
   const channels: FakeRealtimeChannel[] = [];
   const listeners = new Set<AuthCallback>();
   let currentUser = user;
+  let currentClaims = claims;
 
   const record = (
     schema: string,
@@ -293,7 +319,8 @@ export function createFakeSupabase({
     return Promise.resolve({ error: respond(calls.length - 1), count });
   };
 
-  const session = () => (currentUser === null ? null : { user: { id: currentUser } });
+  const session = () =>
+    currentUser === null ? null : { user: { id: currentUser, ...currentClaims } };
 
   const authApi = {
     onAuthStateChange(callback: AuthCallback) {
@@ -368,14 +395,17 @@ export function createFakeSupabase({
         : Promise.resolve('ok');
     },
     auth: auth ? authApi : throwingAuth,
-    setUser(userId) {
+    setUser(userId, nextClaims) {
       currentUser = userId;
+      currentClaims = nextClaims ?? currentClaims;
 
       for (const listener of listeners) {
         listener(userId === null ? 'SIGNED_OUT' : 'SIGNED_IN', session());
       }
     },
-    refreshToken() {
+    refreshToken(nextClaims) {
+      currentClaims = nextClaims ?? currentClaims;
+
       for (const listener of listeners) {
         listener('TOKEN_REFRESHED', session());
       }

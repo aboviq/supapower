@@ -539,3 +539,93 @@ describe('createSupapower().sync - tables outside "public"', () => {
     expect(String(thrown)).toContain('Table "app"."tags"');
   });
 });
+
+describe('createSupapower().sync - filtering', () => {
+  let env: FakeLeadershipEnv;
+
+  beforeEach(() => {
+    env = installLeadershipEnv();
+  });
+
+  afterEach(() => {
+    env.restore();
+  });
+
+  const start = async (supabase: FakeSupabase, pg: FakePGlite) => {
+    const sync = await createSupapower(asPGlite(pg)).sync({
+      supabase: asSupabaseClient(supabase),
+      tables: [
+        {
+          table: 'todos',
+          filter: (f, session) =>
+            f.eq('workspace_id', session?.user.app_metadata['workspace'] ?? ''),
+        },
+      ],
+    });
+
+    env.locks.grant();
+    await settle();
+
+    return sync;
+  };
+
+  test('downloads with the filter a claim resolves to', async () => {
+    const pg = createFakePGlite({ columns: { todos: ['id', 'workspace_id'] } });
+    const supabase = createFakeSupabase({
+      user: 'user-a',
+      claims: { app_metadata: { workspace: 'a' } },
+    });
+
+    const sync = await start(supabase, pg);
+
+    expect(
+      await waitFor(() => supabase.calls.includes('select:todos:filter(workspace_id=eq.a)')),
+    ).toBe(true);
+
+    sync.unsubscribe();
+  });
+
+  test('a changed claim empties the table and downloads it again, without signing out', async () => {
+    const pg = createFakePGlite({ columns: { todos: ['id', 'workspace_id'] } });
+    const supabase = createFakeSupabase({
+      user: 'user-a',
+      claims: { app_metadata: { workspace: 'a' } },
+    });
+
+    const sync = await start(supabase, pg);
+
+    await waitFor(() => supabase.calls.includes('select:todos:filter(workspace_id=eq.a)'));
+
+    supabase.refreshToken({ app_metadata: { workspace: 'b' } });
+
+    expect(await waitFor(() => pg.truncated.includes('todos'))).toBe(true);
+    expect(
+      await waitFor(() => supabase.calls.includes('select:todos:filter(workspace_id=eq.b)')),
+    ).toBe(true);
+
+    sync.unsubscribe();
+  });
+
+  test('an unchanged claim does not restart the session', async () => {
+    const pg = createFakePGlite({ columns: { todos: ['id', 'workspace_id'] } });
+    const supabase = createFakeSupabase({
+      user: 'user-a',
+      claims: { app_metadata: { workspace: 'a' } },
+    });
+
+    const sync = await start(supabase, pg);
+
+    await waitFor(() => supabase.calls.includes('select:todos:filter(workspace_id=eq.a)'));
+
+    const channelCount = supabase.channels.length;
+    const callCount = supabase.calls.length;
+
+    supabase.refreshToken({ app_metadata: { workspace: 'a' } });
+    await settle();
+
+    expect(supabase.channels.length).toBe(channelCount);
+    expect(supabase.calls.length).toBe(callCount);
+
+    sync.unsubscribe();
+  });
+});

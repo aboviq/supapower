@@ -46,6 +46,28 @@ describe('runIncomingSync', () => {
     await running;
   });
 
+  test('carries a resolved filter on its binding, leaves an unfiltered table out', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase();
+    const controller = new AbortController();
+    const filtered = resolveTablesWith(
+      ['todos', { table: 'tags', primaryKey: 'tag_id', filter: (f) => f.eq('workspace_id', 7) }],
+      { todos: ['id', 'title'], tags: ['tag_id', 'name', 'workspace_id'] },
+    );
+
+    const running = runIncomingSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables: filtered,
+      signal: controller.signal,
+    });
+
+    expect(supabase.openChannel?.filters).toEqual([undefined, 'workspace_id=eq.7']);
+
+    controller.abort();
+    await running;
+  });
+
   test('opens no channel when there is nothing the user may see', async () => {
     const supabase = createFakeSupabase();
 

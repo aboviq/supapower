@@ -317,6 +317,12 @@ interface SupapowerTableConfig {
    * @default "authenticated"
    */
   access?: 'anon' | 'authenticated';
+  /**
+   * Narrows which rows this table syncs, applied to both the download and
+   * the realtime subscription. Handed a fresh filter builder and the
+   * current session, and must return the builder.
+   */
+  filter?: (filter: SupapowerFilter, session: Session | null) => SupapowerFilter;
 }
 ```
 
@@ -395,6 +401,38 @@ await pg.supapower.sync({
   ],
 });
 ```
+
+###### Table `filter` configuration
+
+`filter` narrows which rows a table syncs. It is handed a fresh filter builder and the current
+session, and must return the builder; the same filter narrows both the PostgREST download and the
+`postgres_changes` subscription:
+
+```ts
+{
+  table: 'todos',
+  filter: (filter, session) => filter.eq('workspace_id', session?.user.app_metadata['workspace']),
+}
+```
+
+A few boundaries follow from how it is applied:
+
+- **Conditions are `AND`ed only.** No `OR`, no subqueries, no joins. A membership rule only fits as
+  an `in` list, capped at 100 values by Realtime - see
+  [Postgres Changes filters](https://supabase.com/docs/guides/realtime/postgres-changes#available-filters).
+- **A filtered subscription only delivers `DELETE` events when the remote table's replica identity
+  is `full`**, since the filter is evaluated against the old record - another reason for the soft
+  deletes already recommended under [Schema recommendations](#schema-recommendations).
+- **A changed resolved filter - typically because a claim in a refreshed token changed - truncates
+  the local table and downloads it again.** A row still waiting in the outgoing queue is gone
+  locally until its upload echoes back.
+- **Nothing removes a row that stops matching the filter on its own.** Rows only ever arrive as
+  upserts, and neither the download nor the subscription reports a row that no longer matches.
+- **Local writes to rows outside the filter still upload** - row-level security decides, the filter
+  does not.
+- **A callback that throws stops that table syncing for that session** and reports `filter_failed`
+  (an `in` with an empty list, for one). Use `is(column, null)` on a `NOT NULL` column to sync
+  nothing on purpose.
 
 ### `supapower.events`
 
@@ -650,6 +688,7 @@ const sync = await pg.supapower.sync({ supabase, tables: ['todos'] });
 | `delete_ignored`    | Supabase accepted a `DELETE` that matched no row                 |
 | `update_ignored`    | Supabase accepted an `UPDATE` that matched no row                |
 | `schema_mismatch`   | A queued change names a table that is not configured for syncing |
+| `filter_failed`     | A table's `filter` callback failed, so the table is not syncing  |
 
 `asSupapowerError(value, message, code)` from `supapower/errors` is the same wrapper, if you want to
 funnel your own failures into the same shape.

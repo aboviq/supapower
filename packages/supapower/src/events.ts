@@ -1,13 +1,13 @@
 import type { SupapowerError } from './errors.js';
-import type { SupapowerSyncedTable } from './types.js';
+import type { SupapowerScopedTable } from './types.js';
 
 /**
  * A `downloadTableStart`/`downloadTableFinish` event, containing the table config it is for.
  */
 export class SupapowerTableEvent extends Event {
-  readonly config: SupapowerSyncedTable;
+  readonly config: SupapowerScopedTable;
 
-  constructor(type: 'downloadTableStart' | 'downloadTableFinish', config: SupapowerSyncedTable) {
+  constructor(type: 'downloadTableStart' | 'downloadTableFinish', config: SupapowerScopedTable) {
     super(type);
     this.config = config;
   }

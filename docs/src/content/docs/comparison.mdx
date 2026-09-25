@@ -30,10 +30,10 @@ does **not** use Electric's sync service - the two are unrelated beyond sharing 
 | Local queries               | SQL (PostgreSQL)                                                | Mango-style selectors over JSON documents                          | SQL (SQLite)                                                             | Whatever your client store offers                  | ZQL                                                          |
 | Backends supported          | Supabase only                                                   | Supabase, CouchDB, GraphQL, Firestore or any HTTP backend          | Postgres, MongoDB, MySQL, SQL Server and more                            | Any Postgres with logical replication              | Any Postgres with logical replication                        |
 | Direction                   | Two-way                                                         | Two-way                                                            | Two-way                                                                  | Read path only - you build the write path          | Two-way                                                      |
-| What a client may sync      | Your RLS policies, unchanged                                    | Your RLS policies, plus a client-side pull query                   | Sync Streams, configured separately from RLS                             | Shapes, scoped by your auth proxy                  | ZQL queries plus permission rules in app code                |
+| What a client may sync      | Your RLS policies, plus an optional per-table filter            | Your RLS policies, plus a client-side pull query                   | Sync Streams, configured separately from RLS                             | Shapes, scoped by your auth proxy                  | ZQL queries plus permission rules in app code                |
 | Write path                  | Queued locally, upserted through PostgREST                      | Queued locally, pushed through PostgREST with concurrency guards   | Your own upload endpoint (`uploadData`)                                  | Your own API                                       | Custom mutators on the server                                |
 | Conflict model              | Per-column merge in Postgres, last-write-wins within a column   | Per document; the server version wins unless you write a handler   | Server-authoritative, last-write-wins per field                          | Yours to define                                    | Server-authoritative; optimistic client state is rolled back |
-| Partial sync of a big table | No - a table syncs whole, minus what RLS hides                  | Yes - pull query filters                                           | Yes - Sync Streams                                                       | Yes - Shapes                                       | Yes - queries                                                |
+| Partial sync of a big table | Yes - a per-table `filter` callback, resolved per session       | Yes - pull query filters                                           | Yes - Sync Streams                                                       | Yes - Shapes                                       | Yes - queries                                                |
 | Demands on your schema      | A single-column primary key; `updated_at` to sync incrementally | String primary keys, plus `_deleted` and `_modified` columns       | Client-side schema in app code                                           | None                                               | None                                                         |
 | Client platforms            | Web, Node, Bun, Deno (JS/TS)                                    | Web, Node, React Native, Electron, Capacitor                       | Web, React Native, Flutter, Kotlin, Swift                                | Web and anything that can speak its HTTP API       | Web                                                          |
 | License                     | Apache-2.0                                                      | Apache-2.0 core; paid license for the faster storages              | SDKs Apache-2.0; service under FSL 1.1 with an Apache-2.0 future license | Apache-2.0                                         | Apache-2.0                                                   |
@@ -79,6 +79,12 @@ database's own: no second permission model to write.
 In every case it does come down to a filter attached to a table - what differs is who writes the
 filter, and whether a client can change it at runtime.
 
+- **Supapower** - a `filter` callback on the table config, composed in client code, is handed the
+  current session so it can key off a claim (e.g. `filter.eq('workspace_id', session.user.app_metadata.workspace_id)`),
+  and is applied to both the PostgREST download and the `postgres_changes` subscription.
+  Conditions are `AND`ed, with no `OR`, no subqueries and no joins, so a membership rule only fits
+  as an `in` list of at most 100 values. RLS is still what stops a client widening its own filter.
+  See [`filter`](/packages/supapower/#table-filter-configuration).
 - **RxDB** - the Supabase plugin takes a `pull.queryBuilder`, so the pull is an ordinary PostgREST
   query you can narrow (`query.eq('status', 'active')`) or point at joined tables. The filter lives
   in client code, so RLS is still what stops a client from asking for more. See
@@ -97,17 +103,16 @@ filter, and whether a client can change it at runtime.
   query can pull in relationships, so the unit is a query result rather than a single table. See
   [Queries](https://zero.rocicorp.dev/docs/queries).
 
-Supapower has no equivalent knob. A tracked table is downloaded whole - the request selects the
-columns the local schema knows, orders by primary key and pages through, narrowed only by the
-[`cursor`](/packages/supapower/#table-cursor-configuration) watermark, which limits how far back in
-time it reads rather than which rows qualify. The realtime subscription binds to a schema and table
-with no filter either.
+The filter is what narrows both the download and the subscription;
+[`cursor`](/packages/supapower/#table-cursor-configuration) still only narrows how far back in time
+a download reads, not which rows qualify. RLS still decides what the filter is allowed to return -
+a `filter` callback can only narrow further, never widen past it. A filter resolved from the
+session is re-resolved on every auth change, and a change to it empties the local table and
+downloads it again.
 
-What a client actually ends up holding is whatever its RLS policies return, so the lever for "this
-client should only have its own rows" is the policy, not a per-client filter. When a table is
-bigger than the narrowest slice a policy can express, the workaround is to split the hot subset
-into its own table - optionally in a
-[separate schema](/packages/supapower/#table-schema-configuration) - and track that instead.
+When a table is bigger than the narrowest slice a column filter can express - a membership rule
+that needs a join, say - splitting the hot subset into its own table - optionally in a
+[separate schema](/packages/supapower/#table-schema-configuration) - is the answer for that slice.
 
 ## Also in the field
 

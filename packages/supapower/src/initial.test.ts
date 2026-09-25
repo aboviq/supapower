@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import { createSupapowerEvents } from './events.js';
-import { reconcileUser, runInitialSync } from './sync.js';
+import { reconcileFilters, reconcileUser, runInitialSync } from './sync.js';
 import { createChange } from './tests/changes.js';
 import { asPGlite, createFakePGlite } from './tests/pglite.js';
 import { asSupabaseClient, createFakeSupabase } from './tests/supabase.js';
@@ -126,6 +126,28 @@ describe('runInitialSync', () => {
     });
 
     expect(supabase.calls).toEqual([]);
+  });
+
+  test('narrows the download and records the filter it ran with', async () => {
+    const pg = createFakePGlite();
+    const supabase = createFakeSupabase();
+    const filtered = resolveTablesWith(
+      [{ table: 'todos', filter: (f) => f.eq('workspace_id', 7) }],
+      { todos: ['id', 'title', 'workspace_id'] },
+    );
+
+    await runInitialSync({
+      pg: asPGlite(pg),
+      supabase: asSupabaseClient(supabase),
+      tables: filtered,
+      signal: live(),
+    });
+
+    expect(supabase.calls).toEqual(['select:todos:filter(workspace_id=eq.7)']);
+
+    const state = pg.metadata.get('TableSyncState') as Record<string, { filter?: string }>;
+
+    expect(state['"public"."todos"']?.filter).toBe('workspace_id=eq.7');
   });
 });
 
@@ -351,6 +373,73 @@ describe('reconcileUser', () => {
 
     expect(pg.truncated).toEqual(['todos', 'todos']);
     expect(pg.metadata.get('SyncedUser')).toBeNull();
+  });
+});
+
+describe('reconcileFilters', () => {
+  const filteredTable = resolveTablesWith(
+    [{ table: 'todos', filter: (f) => f.eq('workspace_id', 8) }],
+    { todos: ['id', 'workspace_id'] },
+  );
+
+  test('truncates a table whose resolved filter changed since its last download', async () => {
+    const pg = createFakePGlite();
+
+    pg.metadata.set('TableSyncState', {
+      '"public"."todos"': {
+        downloadedAt: 0,
+        columns: ['id', 'workspace_id'],
+        filter: 'workspace_id=eq.7',
+      },
+    });
+
+    const changed = await reconcileFilters(asPGlite(pg), filteredTable);
+
+    expect(changed).toEqual(['"public"."todos"']);
+    expect(pg.truncated).toEqual(['todos']);
+    expect(pg.metadata.get('TableSyncState')).toEqual({});
+  });
+
+  test('leaves queued outgoing changes alone, unlike reconcileUser', async () => {
+    const pg = createFakePGlite({ changes: [createChange('100', 1, { table_name: 'todos' })] });
+
+    pg.metadata.set('TableSyncState', {
+      '"public"."todos"': {
+        downloadedAt: 0,
+        columns: ['id', 'workspace_id'],
+        filter: 'workspace_id=eq.7',
+      },
+    });
+
+    await reconcileFilters(asPGlite(pg), filteredTable);
+
+    expect(pg.queue.map((change) => change.table_name)).toEqual(['todos']);
+  });
+
+  test('does nothing when the resolved filter matches what was stored', async () => {
+    const pg = createFakePGlite();
+
+    pg.metadata.set('TableSyncState', {
+      '"public"."todos"': {
+        downloadedAt: 0,
+        columns: ['id', 'workspace_id'],
+        filter: 'workspace_id=eq.8',
+      },
+    });
+
+    const changed = await reconcileFilters(asPGlite(pg), filteredTable);
+
+    expect(changed).toEqual([]);
+    expect(pg.truncated).toEqual([]);
+  });
+
+  test('does nothing for a table that was never downloaded', async () => {
+    const pg = createFakePGlite();
+
+    const changed = await reconcileFilters(asPGlite(pg), filteredTable);
+
+    expect(changed).toEqual([]);
+    expect(pg.truncated).toEqual([]);
   });
 });
 

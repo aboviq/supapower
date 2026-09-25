@@ -1,20 +1,24 @@
 import type { PGliteInterface } from '@electric-sql/pglite';
-import type { SupabaseClient } from '@supabase/supabase-js';
+import type { Session, SupabaseClient } from '@supabase/supabase-js';
 
 import type { UnrecoverableUploadError } from './changes.js';
 import { asSupapowerError } from './errors.js';
 import { createSupapowerEvents, SupapowerErrorEvent, type SupapowerEventTarget } from './events.js';
+import { resolveFilters, type ResolvedFilters } from './filter.js';
 import { createLeadership } from './leadership.js';
 import { readLocalColumns, runMigrations, trackTables } from './migrations.js';
 import { trackStatus } from './status.js';
 import {
+  reconcileFilters,
   reconcileUser,
   resolveTables,
   runIncomingSync,
   runOutgoingSync,
+  tablesForSession,
   withLocalColumns,
 } from './sync.js';
 import type {
+  ResolvedTableConfig,
   SupapowerNamespace,
   SupapowerSync,
   SupapowerSyncOptions,
@@ -33,17 +37,17 @@ type AuthIdentity = string | null | typeof EXTERNAL_AUTH;
 /**
  * Follows who is signed in, starting with the session that is already there.
  *
- * Only the identity matters, not the token: supabase-js pushes a refreshed
- * token onto the realtime socket by itself, so a `TOKEN_REFRESHED` event needs
- * no reaction here.
+ * Every auth event is reported, `TOKEN_REFRESHED` included: a refreshed token
+ * can carry a claim a table's `filter` callback reads, and only the resolved
+ * session key downstream decides whether anything actually restarts.
  */
 function watchAuthIdentity(
   supabase: SupabaseClient,
-  onChange: (identity: AuthIdentity) => void,
+  onChange: (identity: AuthIdentity, session: Session | null) => void,
 ): () => void {
   try {
     const { data } = supabase.auth.onAuthStateChange((_event, session) => {
-      onChange(session?.user.id ?? null);
+      onChange(session?.user.id ?? null, session ?? null);
     });
 
     return () => data.subscription.unsubscribe();
@@ -51,7 +55,7 @@ function watchAuthIdentity(
     // A client built with the `accessToken` option replaces `supabase.auth`
     // with a proxy that throws on every access: the application owns the token,
     // so there is no auth state to follow and every table stays reachable.
-    onChange(EXTERNAL_AUTH);
+    onChange(EXTERNAL_AUTH, null);
 
     return () => {};
   }
@@ -68,16 +72,28 @@ interface SyncSupervisorOptions {
   downloadThrottle?: number;
 }
 
-/** The tables that are reachable for a given identity. */
-function reachableTables(
-  tables: Map<string, SupapowerSyncedTable>,
+/**
+ * What a sync session is keyed on: who it runs for, and the filter every
+ * configured table resolved to. Equal keys mean a restart would change
+ * nothing, which is what keeps an hourly `TOKEN_REFRESHED` from tearing the
+ * realtime channel down for no reason.
+ */
+function sessionKey(
   identity: AuthIdentity,
-): Map<string, SupapowerSyncedTable> {
-  if (identity !== null) {
-    return tables;
+  tables: Map<string, ResolvedTableConfig>,
+  { filters, failed }: ResolvedFilters,
+): string {
+  const parts = [identity === EXTERNAL_AUTH ? EXTERNAL_USER : String(identity)];
+
+  for (const name of tables.keys()) {
+    // A table whose callback threw keys on `!`, so recovering from that is a
+    // change like any other rather than looking like "no filter".
+    const filter = failed.has(name) ? '!' : (filters.get(name)?.expression ?? '');
+
+    parts.push(`${name}=${filter}`);
   }
 
-  return new Map([...tables].filter(([, config]) => config.access === 'anon'));
+  return parts.join('\n');
 }
 
 /**
@@ -96,8 +112,9 @@ function reachableTables(
  * comes back as a row-level security denial - which the outgoing loop treats as
  * unrecoverable and discards. Those changes stay queued instead.
  *
- * Both directions share one signal per identity, so signing out aborts an
- * upload in flight rather than letting it finish as the wrong user.
+ * Both directions share one signal per session key, so a change to who is
+ * signed in - or to a filter a table resolves for them - aborts an upload in
+ * flight rather than letting it finish under the wrong scope.
  *
  * @returns A promise that resolves once `signal` has aborted and every
  * session it started has finished tearing down.
@@ -111,7 +128,7 @@ function superviseSync({
   onUnrecoverableError,
   downloadThrottle,
 }: SyncSupervisorOptions): Promise<void> {
-  let identity: AuthIdentity | undefined;
+  let current: string | undefined;
   let running: AbortController | undefined;
 
   // Every session started so far. Each one is aborted before the next begins,
@@ -119,25 +136,39 @@ function superviseSync({
   // already been replaced still has to be waited out.
   let sessions: Promise<void> = Promise.resolve();
 
-  const restart = (next: AuthIdentity) => {
-    if (signal.aborted || next === identity) {
-      return; // same user as before, what is already running is still right
+  const restart = (next: AuthIdentity, session: Session | null) => {
+    if (signal.aborted) {
+      return;
     }
 
-    identity = next;
+    const resolved = resolveFilters(tables, session);
+    const key = sessionKey(next, tables, resolved);
+
+    if (key === current) {
+      return; // same user, same filters - what is already running is still right
+    }
+
+    current = key;
+
+    for (const error of resolved.failed.values()) {
+      events.dispatchEvent(new SupapowerErrorEvent(error));
+    }
+
     running?.abort();
     running = new AbortController();
 
-    const session = running.signal;
-    const reachable = reachableTables(tables, next);
+    const live = running.signal;
+
+    const { reachable, syncing } = tablesForSession(tables, resolved, next !== null);
 
     const work = (async () => {
       // Clears out the previous user's rows before anything is downloaded for
       // this one. Reads the user the local data was last synced for from the
       // database, so it also catches a reload with somebody else signed in.
       await reconcileUser(pg, tables, next === EXTERNAL_AUTH ? EXTERNAL_USER : next);
+      await reconcileFilters(pg, syncing);
 
-      if (session.aborted) {
+      if (live.aborted) {
         return;
       }
 
@@ -146,7 +177,7 @@ function superviseSync({
         pg,
         supabase,
         tables: reachable,
-        signal: session,
+        signal: live,
         events,
         ...(onUnrecoverableError ? { onUnrecoverableError } : {}),
       });
@@ -156,8 +187,8 @@ function superviseSync({
         runIncomingSync({
           pg,
           supabase,
-          tables: reachable,
-          signal: session,
+          tables: syncing,
+          signal: live,
           events,
           ...(downloadThrottle === undefined ? {} : { downloadThrottle }),
         }),

@@ -66,9 +66,11 @@ Apache-2.0 with zero runtime dependencies, plus a `SharedWorker` multi-tab host
 ## What it costs you
 
 - Supabase only, by design. Nothing here works against a plain Postgres.
-- Sync granularity is the table, filtered by RLS - there is no
-  [per-query shape or stream](/comparison/#partial-sync-in-detail). A client that may see a million
-  rows will eventually hold a million rows.
+- Sync granularity is the table, filtered by RLS and optionally by a per-table
+  [`filter`](/packages/supapower/#table-filter-configuration) whose conditions are `AND`ed columns -
+  there is still no [per-query shape or stream](/comparison/#partial-sync-in-detail), no `OR` and
+  nothing that reaches across tables, so a client that may see a million rows of one slice will
+  eventually hold them all.
 - Without a [`cursor`](/packages/supapower/#table-cursor-configuration) column every start
   downloads each table whole; with one, the download is incremental but hard `DELETE`s never reach
   clients that were offline - see [database migrations](/guides/database-migrations/) for the

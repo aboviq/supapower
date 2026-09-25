@@ -30,6 +30,7 @@ import {
   SupapowerTableEvent,
   type SupapowerEventTarget,
 } from './events.js';
+import { applyFilter, type ResolvedFilters } from './filter.js';
 import {
   clearTableSyncState,
   getSyncedUser,
@@ -38,7 +39,12 @@ import {
   setTableSyncState,
   type TableSyncState,
 } from './metadata.js';
-import type { ResolvedTableConfig, SupapowerSyncedTable, SupapowerTableConfig } from './types.js';
+import type {
+  ResolvedTableConfig,
+  SupapowerScopedTable,
+  SupapowerSyncedTable,
+  SupapowerTableConfig,
+} from './types.js';
 import { escapeIdentifier, executeInTransaction } from './utils.js';
 
 /** Safety net in case a notification is missed while leadership changes hands. */
@@ -132,6 +138,62 @@ export function withLocalColumns(
   }
 
   return described;
+}
+
+/** The tables one session syncs, in the two sets the sync loops need. */
+export interface SessionTables {
+  /**
+   * Every table this session may reach, scoped to the filter it resolved to.
+   *
+   * What the outgoing queue drains: an upload does not depend on the filter,
+   * so a table whose filter could not be resolved still pushes its changes.
+   */
+  readonly reachable: Map<string, SupapowerScopedTable>;
+  /**
+   * The reachable tables that are also downloaded and subscribed.
+   *
+   * A table whose filter callback threw is left out - pulling it unfiltered
+   * would fetch exactly the rows the filter exists to keep out.
+   */
+  readonly syncing: Map<string, SupapowerScopedTable>;
+}
+
+/**
+ * Scopes each described table to one session: which rows it syncs, and
+ * whether this session may read it at all.
+ *
+ * Runs again whenever a filter resolves to something else, which is what the
+ * supervisor restarts a session for.
+ *
+ * @param resolved Every table's filter for this session, from `resolveFilters`.
+ *   A table left out of `filters` gets `resolvedFilter: null`.
+ * @param signedIn Whether anybody is signed in. With nobody, only the `anon`
+ *   tables are reachable - see `access` in `SupapowerTableConfig`.
+ * @returns The tables reachable (uploads) and syncing (downloads and subscribes) for this session.
+ */
+export function tablesForSession(
+  tables: Map<string, SupapowerSyncedTable>,
+  { filters, failed }: ResolvedFilters,
+  signedIn: boolean,
+): SessionTables {
+  const reachable = new Map<string, SupapowerScopedTable>();
+  const syncing = new Map<string, SupapowerScopedTable>();
+
+  for (const [name, table] of tables) {
+    if (!signedIn && table.access !== 'anon') {
+      continue;
+    }
+
+    const scoped: SupapowerScopedTable = { ...table, resolvedFilter: filters.get(name) ?? null };
+
+    reachable.set(name, scoped);
+
+    if (!failed.has(name)) {
+      syncing.set(name, scoped);
+    }
+  }
+
+  return { reachable, syncing };
 }
 
 function tableFor(
@@ -612,6 +674,55 @@ export async function reconcileUser(
   });
 }
 
+/**
+ * Empties the local table for a table whose resolved filter has changed since
+ * its last download.
+ *
+ * Both narrowing and widening a filter truncate: rows only ever arrive as
+ * upserts, and neither a filtered download nor a filtered subscription ever
+ * reports a row that stopped matching, so a narrowed filter would otherwise
+ * leave those rows behind forever, and a widened one cannot be told apart
+ * from a narrowed one here.
+ *
+ * Unlike {@link reconcileUser}, queued `supapower.changes` rows are left
+ * alone: a changed filter does not make the user's pending writes somebody
+ * else's.
+ *
+ * @returns The tables that were truncated, as their qualified local names.
+ */
+export async function reconcileFilters(
+  pg: PGliteInterface,
+  tables: Map<string, SupapowerScopedTable>,
+): Promise<string[]> {
+  const changed: string[] = [];
+
+  for (const [key, { resolvedFilter }] of tables) {
+    const state = await getTableSyncState(pg, key);
+
+    // A table that never finished a download has nothing to empty - whatever
+    // is there arrives filtered either way.
+    if (state && (state.filter ?? '') !== (resolvedFilter?.expression ?? '')) {
+      changed.push(key);
+    }
+  }
+
+  if (changed.length === 0) {
+    return changed; // nothing to empty, so no transaction to open
+  }
+
+  await pg.transaction(async (tx) => {
+    for (const key of changed) {
+      // TRUNCATE only fires TRUNCATE triggers, so this does not queue itself
+      // up as a pile of outgoing deletes.
+      await tx.query(`TRUNCATE TABLE ${key}`);
+    }
+
+    await clearTableSyncState(tx, changed);
+  });
+
+  return changed;
+}
+
 /** Dresses a downloaded row up as the INSERT event it would have been. */
 function asInsertEvent(
   { schema, table }: ResolvedTableConfig,
@@ -656,7 +767,7 @@ function stillApplies(
 interface DownloadTableOptions {
   pg: PGliteInterface;
   supabase: SupabaseClient;
-  config: SupapowerSyncedTable;
+  config: SupapowerScopedTable;
   signal: AbortSignal;
   events: SupapowerEventTarget;
   /** How long the last completed download of this table counts as fresh. */
@@ -671,7 +782,7 @@ async function downloadTable({
   events,
   throttle,
 }: DownloadTableOptions): Promise<void> {
-  const { cursor, columns, primaryKey } = config;
+  const { cursor, columns, primaryKey, resolvedFilter } = config;
   const name = localName(config);
 
   const stored = await getTableSyncState(pg, name);
@@ -722,8 +833,9 @@ async function downloadTable({
     // Asking for the columns this client has keeps a column it does not know
     // about out of the download entirely, rather than trimming it off on arrival.
     const select = remote(supabase, config).select(columns.map(selectable).join(','));
-    const filtered = cursor && from ? select.gte(cursor, from) : select;
-    const paged = last === null ? filtered : filtered.gt(primaryKey, last);
+    const scoped = resolvedFilter ? applyFilter(select, resolvedFilter) : select;
+    const incremental = cursor && from ? scoped.gte(cursor, from) : scoped;
+    const paged = last === null ? incremental : incremental.gt(primaryKey, last);
 
     const { data, error } = await paged
       .order(primaryKey, { ascending: true })
@@ -801,6 +913,7 @@ async function downloadTable({
     columns: [...columns],
     ...(cursor === undefined ? {} : { cursor }),
     ...(highest === null ? {} : { at: highest }),
+    ...(resolvedFilter === null ? {} : { filter: resolvedFilter.expression }),
   });
 
   events.dispatchEvent(new SupapowerTableEvent('downloadTableFinish', config));
@@ -810,7 +923,7 @@ export interface InitialSyncOptions {
   pg: PGliteInterface;
   supabase: SupabaseClient;
   /** The tables to download, in the order they should be downloaded. */
-  tables: Map<string, SupapowerSyncedTable>;
+  tables: Map<string, SupapowerScopedTable>;
   signal: AbortSignal;
   /**
    * Dispatched for `downloadStart`/`downloadFinish`/`downloadTableStart`/`downloadTableFinish`.
@@ -871,8 +984,10 @@ export interface IncomingSyncOptions {
    *
    * Already filtered for the current user - deciding which tables are
    * reachable is the caller's job, see `access` in `SupapowerTableConfig`.
+   * The filters are already resolved for this session, the same as `access`
+   * is already applied.
    */
-  tables: Map<string, SupapowerSyncedTable>;
+  tables: Map<string, SupapowerScopedTable>;
   /**
    * Aborted when leadership is lost, when the signed in user changes, or when
    * the sync is unsubscribed.
@@ -1008,7 +1123,12 @@ export async function runIncomingSync({
   for (const config of tables.values()) {
     subscription = subscription.on(
       'postgres_changes',
-      { event: '*', schema: config.schema, table: config.table },
+      {
+        event: '*',
+        schema: config.schema,
+        table: config.table,
+        ...(config.resolvedFilter ? { filter: config.resolvedFilter.expression } : {}),
+      },
       (payload: RealtimePostgresChangesPayload<Record<string, unknown>>) => apply(payload, config),
     );
   }

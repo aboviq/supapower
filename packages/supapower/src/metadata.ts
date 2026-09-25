@@ -58,6 +58,8 @@ export interface TableSyncState {
   cursor?: string;
   /** The highest value seen in that cursor column. */
   at?: string;
+  /** The filter expression the download ran with, if it had one. */
+  filter?: string;
 }
 
 /**

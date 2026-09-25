@@ -4,6 +4,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import type { UnrecoverableUploadError } from './changes.js';
 import type { SupapowerError } from './errors.js';
 import type { SupapowerEventTarget } from './events.js';
+import type { ResolvedFilter, SupapowerFilterCallback } from './filter.js';
 import type { LeadershipStrategy } from './leadership.js';
 
 export interface SupapowerTableConfig {
@@ -77,6 +78,20 @@ export interface SupapowerTableConfig {
    * Such tables will be emptied both on sign in (before initial sync) and sign out to make sure data for different users are not mixed in the local database.
    */
   access?: 'anon' | 'authenticated';
+
+  /**
+   * Narrows which rows this table syncs.
+   *
+   * Handed a fresh filter builder and the current session, and must return
+   * the builder. The filter it composes is applied to both the PostgREST
+   * download and the `postgres_changes` subscription; conditions are
+   * `AND`ed. Changing it - typically because a claim in a refreshed session
+   * token changed - empties the local table and downloads it again.
+   *
+   * A client built with supabase-js's `accessToken` option has no session to
+   * hand over and gets `null`.
+   */
+  filter?: SupapowerFilterCallback;
 }
 
 /** A table entry with every default filled in. */
@@ -92,8 +107,9 @@ export interface ResolvedTableConfig extends SupapowerTableConfig {
 /**
  * A resolved table, described against the local database.
  *
- * Only the parts of the sync that read `columns` ask for one; the rest make do
- * with a {@link ResolvedTableConfig}.
+ * The description is static: it comes from the local schema and holds for as
+ * long as the sync runs. Only the parts of the sync that read `columns` ask
+ * for one; the rest make do with a {@link ResolvedTableConfig}.
  */
 export interface SupapowerSyncedTable extends ResolvedTableConfig {
   /**
@@ -104,6 +120,20 @@ export interface SupapowerSyncedTable extends ResolvedTableConfig {
    * trimmed to fit.
    */
   columns: readonly string[];
+}
+
+/**
+ * A described table, scoped to one session.
+ *
+ * What the table's `filter` callback resolved to depends on who is signed in,
+ * so a scoped table only holds for as long as that session does - which is
+ * why the download, the subscription and the truncation on a changed filter
+ * ask for one, while everything static makes do with a
+ * {@link SupapowerSyncedTable}.
+ */
+export interface SupapowerScopedTable extends SupapowerSyncedTable {
+  /** The filter this table's `filter` callback resolved to, if it has one. */
+  resolvedFilter: ResolvedFilter | null;
 }
 
 export interface SupapowerSyncOptions {
@@ -288,3 +318,13 @@ export interface SupapowerNamespace {
 export type PGliteWithSupapower = PGliteInterface & {
   supapower: SupapowerNamespace;
 };
+
+export type {
+  ResolvedFilter,
+  ResolvedFilterCondition,
+  SupapowerFilter,
+  SupapowerFilterCallback,
+  SupapowerFilterIsValue,
+  SupapowerFilterListValue,
+  SupapowerFilterValue,
+} from './filter.js';

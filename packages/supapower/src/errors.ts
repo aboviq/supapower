@@ -17,6 +17,8 @@ export type SupapowerErrorCode =
   | 'delete_ignored'
   /** Reading from Supabase failed. */
   | 'download_failed'
+  /** A table's filter callback failed, so the table is not syncing. */
+  | 'filter_failed'
   /** A queued change names a table that is not configured for syncing. */
   | 'schema_mismatch'
   /** Supabase accepted an `UPDATE` that matched no row. */
